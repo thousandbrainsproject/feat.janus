@@ -247,7 +247,7 @@ class EvidenceGraphLM(GraphLM):
         x_percent_threshold=10,
         path_similarity_threshold=0.1,
         pose_similarity_threshold=0.35,
-        required_symmetry_evidence=5,
+        required_symmetry_evidence=100,
         graph_delta_thresholds=None,
         max_graph_size=0.3,  # 30cm
         max_nodes_per_graph=2000,
@@ -272,6 +272,7 @@ class EvidenceGraphLM(GraphLM):
         if self.gsg:
             self.gsg.parent_lm = self
 
+        print(f"required_symmetry_evidence: {required_symmetry_evidence}")
         # --- Matching Params ---
         self.max_match_distance = max_match_distance
         self.tolerances = tolerances

@@ -490,7 +490,7 @@ class EvidenceGoalGenerator(GraphGoalGenerator):
         min_post_goal_success_steps=np.inf,
         x_percent_scale_factor=0.75,
         desired_object_distance=0.03,
-        wait_growth_multiplier=2,
+        wait_growth_multiplier=1,
         **kwargs,
     ) -> None:
         """Initialize the Evidence GSG.

@@ -232,9 +232,9 @@ class EvidenceLMTest(BaseGraphTest):
                 if graph_lm._persistent_hypothesis_ids:
                     confidence_reached_at_step = step
                 else:
-                    evidence_sums, counts = model.get_match_evidence()
+                    evidence_means, counts = model.get_match_evidence()
                     self.assertTrue(
-                        np.all(np.isnan(evidence_sums)) and np.all(counts == 0),
+                        np.all(np.isnan(evidence_means)) and np.all(counts == 0),
                         "Model should not be annotated before the persistence "
                         "condition is met.",
                     )
@@ -248,8 +248,8 @@ class EvidenceLMTest(BaseGraphTest):
             ["new_object0"],
             "Persistent hypotheses should be narrowed down to new_object0.",
         )
-        evidence_sums, counts = model.get_match_evidence()
-        annotated = ~np.isnan(evidence_sums)
+        evidence_means, counts = model.get_match_evidence()
+        annotated = ~np.isnan(evidence_means)
         self.assertGreater(
             np.sum(annotated),
             0,
@@ -257,7 +257,7 @@ class EvidenceLMTest(BaseGraphTest):
             "been annotated.",
         )
         self.assertGreater(
-            np.max(evidence_sums[annotated]),
+            np.max(evidence_means[annotated]),
             0,
             "Since observations match the model exactly, at least one "
             "annotated point should have positive match evidence.",

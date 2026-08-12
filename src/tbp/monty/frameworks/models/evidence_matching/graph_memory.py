@@ -17,6 +17,7 @@ import numpy as np
 
 from tbp.monty.frameworks.models.graph_matching import GraphMemory
 from tbp.monty.frameworks.models.object_model import (
+    DEFAULT_MATCH_EVIDENCE_SMOOTHING,
     GridObjectModel,
     GridTooSmallError,
 )
@@ -148,6 +149,10 @@ class EvidenceGraphMemory(GraphMemory):
                 # don't have the metadata store yet.
                 if not hasattr(channel_model, "_match_evidence"):
                     channel_model._match_evidence = {}
+                if not hasattr(channel_model, "match_evidence_smoothing"):
+                    channel_model.match_evidence_smoothing = (
+                        DEFAULT_MATCH_EVIDENCE_SMOOTHING
+                    )
 
                 logger.info(f"Loaded {model} for {input_channel}")
                 self.models_in_memory[graph_id][input_channel] = channel_model

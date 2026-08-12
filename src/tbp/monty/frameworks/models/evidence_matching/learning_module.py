@@ -948,8 +948,9 @@ class EvidenceGraphLM(GraphLM):
         symmetric hypotheses. For every model point that was matched against one
         of these hypotheses this step (a nearest neighbor within
         max_match_distance of the hypothesis' search location), the evidence it
-        matched by (positive if it matched well, negative if poorly) is
-        accumulated into the object model's metadata.
+        matched by (positive if it matched well, negative if poorly) is folded
+        into an exponential moving average stored in the object model's
+        metadata.
         """
         if len(self._persistent_hypothesis_ids) != 1:
             return

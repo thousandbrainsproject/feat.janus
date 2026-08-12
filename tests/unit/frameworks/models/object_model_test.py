@@ -331,10 +331,10 @@ class ObjectModelTest(unittest.TestCase):
 
     def test_match_evidence_is_unannotated_by_default(self):
         model = self.build_grid_model()
-        evidence_sums, counts = model.get_match_evidence()
-        self.assertEqual(len(evidence_sums), model.num_nodes)
+        evidence_means, counts = model.get_match_evidence()
+        self.assertEqual(len(evidence_means), model.num_nodes)
         self.assertTrue(
-            np.all(np.isnan(evidence_sums)),
+            np.all(np.isnan(evidence_means)),
             "No match evidence should be stored before annotating.",
         )
         self.assertTrue(
@@ -342,27 +342,60 @@ class ObjectModelTest(unittest.TestCase):
             "No annotation counts should be stored before annotating.",
         )
 
-    def test_match_evidence_accumulates(self):
+    def test_match_evidence_accumulates_as_exponential_moving_average(self):
         model = self.build_grid_model()
         model.annotate_match_evidence(node_ids=[0, 1], evidence_values=[1.0, -0.5])
         model.annotate_match_evidence(node_ids=[0], evidence_values=[-0.25])
 
-        evidence_sums, counts = model.get_match_evidence()
+        evidence_means, counts = model.get_match_evidence()
+        smoothing = model.match_evidence_smoothing
         self.assertAlmostEqual(
-            evidence_sums[0],
-            0.75,
-            msg="Evidence for node 0 should accumulate to 1.0 - 0.25 = 0.75.",
+            evidence_means[0],
+            1.0 + smoothing * (-0.25 - 1.0),
+            msg="Evidence for node 0 should be the EMA of [1.0, -0.25], seeded "
+            "with the first value.",
         )
         self.assertEqual(counts[0], 2, "Node 0 was annotated twice.")
         self.assertAlmostEqual(
-            evidence_sums[1],
+            evidence_means[1],
             -0.5,
             msg="Evidence for node 1 should be -0.5 (negative evidence allowed).",
         )
         self.assertEqual(counts[1], 1, "Node 1 was annotated once.")
         self.assertTrue(
-            np.all(np.isnan(evidence_sums[2:])),
+            np.all(np.isnan(evidence_means[2:])),
             "Nodes that were never annotated should stay unannotated.",
+        )
+
+    def test_match_evidence_stays_bounded(self):
+        """The moving average stays within the range of annotated values."""
+        model = self.build_grid_model()
+        for _ in range(100):
+            model.annotate_match_evidence(node_ids=[0], evidence_values=[2.0])
+        evidence_means, counts = model.get_match_evidence()
+        self.assertAlmostEqual(
+            evidence_means[0],
+            2.0,
+            msg="Repeatedly annotating with the same value should keep the "
+            "average at that value instead of growing without bound.",
+        )
+        self.assertEqual(counts[0], 100)
+
+    def test_match_evidence_weights_recent_values_more(self):
+        """Old annotations decay so the EMA tracks recent match quality."""
+        model = self.build_grid_model()
+        # Node initially matched well...
+        for _ in range(10):
+            model.annotate_match_evidence(node_ids=[0], evidence_values=[2.0])
+        # ...but recently matched poorly.
+        for _ in range(50):
+            model.annotate_match_evidence(node_ids=[0], evidence_values=[-1.0])
+        evidence_means, _ = model.get_match_evidence()
+        self.assertLess(
+            evidence_means[0],
+            -0.9,
+            "After many recent negative matches, the EMA should have decayed "
+            "close to the recent value despite the earlier positive matches.",
         )
 
     def test_match_evidence_survives_model_update(self):
@@ -385,15 +418,15 @@ class ObjectModelTest(unittest.TestCase):
             annotated_voxels,
             "Voxel-level match evidence should be untouched by a model update.",
         )
-        evidence_sums, counts = model.get_match_evidence()
-        annotated = ~np.isnan(evidence_sums)
+        evidence_means, counts = model.get_match_evidence()
+        annotated = ~np.isnan(evidence_means)
         self.assertEqual(
             np.sum(annotated),
             1,
             "Exactly one node should map to the annotated voxel after the "
             "graph rebuild.",
         )
-        self.assertAlmostEqual(float(evidence_sums[annotated][0]), 1.5)
+        self.assertAlmostEqual(float(evidence_means[annotated][0]), 1.5)
         self.assertEqual(counts[annotated][0], 1)
 
     def test_match_evidence_survives_serialization_round_trip(self):
@@ -410,9 +443,9 @@ class ObjectModelTest(unittest.TestCase):
             model._match_evidence,
             "Match evidence should persist through torch.save/torch.load.",
         )
-        original_sums, original_counts = model.get_match_evidence()
-        loaded_sums, loaded_counts = loaded_model.get_match_evidence()
-        np.testing.assert_array_equal(loaded_sums, original_sums)
+        original_means, original_counts = model.get_match_evidence()
+        loaded_means, loaded_counts = loaded_model.get_match_evidence()
+        np.testing.assert_array_equal(loaded_means, original_means)
         np.testing.assert_array_equal(loaded_counts, original_counts)
 
     def test_match_evidence_works_with_original_graph_models(self):
@@ -429,8 +462,8 @@ class ObjectModelTest(unittest.TestCase):
         model.set_graph(source_model._graph)
 
         model.annotate_match_evidence(node_ids=[1], evidence_values=[0.5])
-        evidence_sums, counts = model.get_match_evidence()
-        self.assertAlmostEqual(float(evidence_sums[1]), 0.5)
+        evidence_means, counts = model.get_match_evidence()
+        self.assertAlmostEqual(float(evidence_means[1]), 0.5)
         self.assertEqual(counts[1], 1)
-        annotated = ~np.isnan(evidence_sums)
+        annotated = ~np.isnan(evidence_means)
         self.assertEqual(np.sum(annotated), 1)

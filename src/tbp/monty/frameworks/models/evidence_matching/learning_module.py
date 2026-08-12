@@ -247,7 +247,7 @@ class EvidenceGraphLM(GraphLM):
         x_percent_threshold=10,
         path_similarity_threshold=0.1,
         pose_similarity_threshold=0.35,
-        required_symmetry_evidence=100,
+        required_symmetry_evidence=5,
         graph_delta_thresholds=None,
         max_graph_size=0.3,  # 30cm
         max_nodes_per_graph=2000,
@@ -955,6 +955,7 @@ class EvidenceGraphLM(GraphLM):
             return
         graph_id, persistent_ids = next(iter(self._persistent_hypothesis_ids.items()))
         match_info = self._latest_match_info.get(graph_id)
+        logger.info("Annotating match info!")
         if not match_info:
             return
         for channel, info in match_info.items():

@@ -202,6 +202,71 @@ class EvidenceLMTest(BaseGraphTest):
             "Since we have symmetry here, 180, 0, 180 should also be a possible pose.",
         )
 
+    def test_match_evidence_annotation_after_confidence(self):
+        """Model points are annotated once the hypothesis set has persisted.
+
+        Before the persistence ("high confidence") condition is met, no match
+        evidence should be written to the object model. Once the persistent
+        hypotheses have narrowed down to a single object, every matching step
+        should annotate the matched model points with the evidence they
+        matched by.
+        """
+        fake_obs_test = copy.deepcopy(self.fake_obs_learn)
+
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        # Lower the persistence requirement so confidence is reached within a
+        # few steps.
+        graph_lm.required_symmetry_evidence = 3
+
+        graph_lm.mode = ExperimentMode.EVAL
+        graph_lm.reset_stm()
+        graph_lm.fixme_reset_ground_truth(primary_target=self.placeholder_target)
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        confidence_reached_at_step = None
+        for step in range(12):
+            observation = fake_obs_test[step % 4]
+            graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+            graph_lm.matching_step(self.ctx, [observation])
+            if confidence_reached_at_step is None:
+                if graph_lm._persistent_hypothesis_ids:
+                    confidence_reached_at_step = step
+                else:
+                    evidence_sums, counts = model.get_match_evidence()
+                    self.assertTrue(
+                        np.all(np.isnan(evidence_sums)) and np.all(counts == 0),
+                        "Model should not be annotated before the persistence "
+                        "condition is met.",
+                    )
+
+        self.assertIsNotNone(
+            confidence_reached_at_step,
+            "The LM should have reached the persistence condition.",
+        )
+        self.assertListEqual(
+            list(graph_lm._persistent_hypothesis_ids.keys()),
+            ["new_object0"],
+            "Persistent hypotheses should be narrowed down to new_object0.",
+        )
+        evidence_sums, counts = model.get_match_evidence()
+        annotated = ~np.isnan(evidence_sums)
+        self.assertGreater(
+            np.sum(annotated),
+            0,
+            "Model points matched by the persistent hypotheses should have "
+            "been annotated.",
+        )
+        self.assertGreater(
+            np.max(evidence_sums[annotated]),
+            0,
+            "Since observations match the model exactly, at least one "
+            "annotated point should have positive match evidence.",
+        )
+        self.assertTrue(
+            np.all(counts[annotated] > 0),
+            "Annotated points should have a positive annotation count.",
+        )
+
     def test_same_sequence_recognition_elm(self):
         fake_obs_test = copy.deepcopy(self.fake_obs_learn)
 

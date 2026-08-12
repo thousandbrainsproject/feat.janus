@@ -9,9 +9,12 @@
 # https://opensource.org/licenses/MIT.
 
 import copy
+import os
+import tempfile
 import unittest
 
 import numpy as np
+import torch
 
 from tbp.monty.frameworks.models.object_model import (
     GraphObjectModel,
@@ -315,3 +318,119 @@ class ObjectModelTest(unittest.TestCase):
                 self.dummy_locs,
                 self.dummy_features,
             )
+
+    def build_grid_model(self):
+        model = GridObjectModel(
+            "test_model", max_nodes=10, max_size=10, num_voxels_per_dim=10
+        )
+        model.build_model(
+            self.dummy_locs,
+            self.dummy_features,
+        )
+        return model
+
+    def test_match_evidence_is_unannotated_by_default(self):
+        model = self.build_grid_model()
+        evidence_sums, counts = model.get_match_evidence()
+        self.assertEqual(len(evidence_sums), model.num_nodes)
+        self.assertTrue(
+            np.all(np.isnan(evidence_sums)),
+            "No match evidence should be stored before annotating.",
+        )
+        self.assertTrue(
+            np.all(counts == 0),
+            "No annotation counts should be stored before annotating.",
+        )
+
+    def test_match_evidence_accumulates(self):
+        model = self.build_grid_model()
+        model.annotate_match_evidence(node_ids=[0, 1], evidence_values=[1.0, -0.5])
+        model.annotate_match_evidence(node_ids=[0], evidence_values=[-0.25])
+
+        evidence_sums, counts = model.get_match_evidence()
+        self.assertAlmostEqual(
+            evidence_sums[0],
+            0.75,
+            msg="Evidence for node 0 should accumulate to 1.0 - 0.25 = 0.75.",
+        )
+        self.assertEqual(counts[0], 2, "Node 0 was annotated twice.")
+        self.assertAlmostEqual(
+            evidence_sums[1],
+            -0.5,
+            msg="Evidence for node 1 should be -0.5 (negative evidence allowed).",
+        )
+        self.assertEqual(counts[1], 1, "Node 1 was annotated once.")
+        self.assertTrue(
+            np.all(np.isnan(evidence_sums[2:])),
+            "Nodes that were never annotated should stay unannotated.",
+        )
+
+    def test_match_evidence_survives_model_update(self):
+        model = self.build_grid_model()
+        model.annotate_match_evidence(node_ids=[0], evidence_values=[1.5])
+        annotated_voxels = copy.deepcopy(model._match_evidence)
+
+        # Rebuild the graph from the grids by adding the same observations again
+        # (identity transform keeps them at the same locations/voxels).
+        model.update_model(
+            locations=self.dummy_locs,
+            features=self.dummy_features,
+            location_rel_model=np.zeros(3),
+            object_location_rel_body=np.zeros(3),
+            object_rotation=Rotation.from_euler("xyz", [0, 0, 0]),
+        )
+
+        self.assertEqual(
+            model._match_evidence,
+            annotated_voxels,
+            "Voxel-level match evidence should be untouched by a model update.",
+        )
+        evidence_sums, counts = model.get_match_evidence()
+        annotated = ~np.isnan(evidence_sums)
+        self.assertEqual(
+            np.sum(annotated),
+            1,
+            "Exactly one node should map to the annotated voxel after the "
+            "graph rebuild.",
+        )
+        self.assertAlmostEqual(float(evidence_sums[annotated][0]), 1.5)
+        self.assertEqual(counts[annotated][0], 1)
+
+    def test_match_evidence_survives_serialization_round_trip(self):
+        model = self.build_grid_model()
+        model.annotate_match_evidence(node_ids=[0, 2], evidence_values=[2.0, -1.0])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = os.path.join(tmp_dir, "model.pt")
+            torch.save(model, model_path)
+            loaded_model = torch.load(model_path, weights_only=False)
+
+        self.assertEqual(
+            loaded_model._match_evidence,
+            model._match_evidence,
+            "Match evidence should persist through torch.save/torch.load.",
+        )
+        original_sums, original_counts = model.get_match_evidence()
+        loaded_sums, loaded_counts = loaded_model.get_match_evidence()
+        np.testing.assert_array_equal(loaded_sums, original_sums)
+        np.testing.assert_array_equal(loaded_counts, original_counts)
+
+    def test_match_evidence_works_with_original_graph_models(self):
+        """Models loaded with use_original_graph=True have no grids.
+
+        The location->voxel mapping needed for annotation should be initialized
+        lazily in that case.
+        """
+        source_model = self.build_grid_model()
+        model = GridObjectModel(
+            "test_model", max_nodes=10, max_size=10, num_voxels_per_dim=10
+        )
+        model.use_original_graph = True
+        model.set_graph(source_model._graph)
+
+        model.annotate_match_evidence(node_ids=[1], evidence_values=[0.5])
+        evidence_sums, counts = model.get_match_evidence()
+        self.assertAlmostEqual(float(evidence_sums[1]), 0.5)
+        self.assertEqual(counts[1], 1)
+        annotated = ~np.isnan(evidence_sums)
+        self.assertEqual(np.sum(annotated), 1)

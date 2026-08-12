@@ -401,6 +401,12 @@ class GridObjectModel(GraphObjectModel):
         # filled or used to constrain nodes in graph.
         self.use_original_graph = False
         self._location_tree = None
+        # Match-evidence metadata accumulated during inference. Maps a voxel index
+        # (i, j, k) to [evidence_sum, count]. Voxels without an entry are
+        # unannotated (None semantics). Stored at the voxel level (rather than per
+        # graph node) so annotations survive graph rebuilds in update_model, and
+        # as a plain dict so it serializes cleanly with torch.save.
+        self._match_evidence: dict[tuple[int, int, int], list] = {}
 
     # =============== Public Interface Functions ===============
     # ------------------- Main Algorithm -----------------------
@@ -496,6 +502,68 @@ class GridObjectModel(GraphObjectModel):
             return distances
 
         return nearest_node_ids
+
+    def annotate_match_evidence(self, node_ids, evidence_values) -> None:
+        """Accumulate match-evidence metadata for the given graph nodes.
+
+        The nodes' locations are mapped to voxel indices and each evidence value
+        is added to the running sum (and count) stored for that voxel. Storing
+        the metadata at the voxel level means it survives graph rebuilds in
+        update_model and persists across episodes as part of the model.
+
+        Args:
+            node_ids: Indices of nodes in the graph to annotate.
+            evidence_values: Evidence value each node matched by (one per node
+                id, can be positive or negative).
+        """
+        if self._graph is None:
+            return
+        if getattr(self, "_location_scale_factor", None) is None:
+            # Pretrained models loaded with use_original_graph=True never built
+            # grids. Only the location->voxel mapping is needed for annotation,
+            # so initialize it lazily from the first graph node.
+            self._initialize_location_mapping(np.asarray(self.pos[0]))
+        node_ids = np.asarray(node_ids, dtype=int)
+        evidence_values = np.asarray(evidence_values, dtype=float)
+        voxel_ids = self._locations_to_grid_ids(np.asarray(self.pos)[node_ids])
+        for voxel, evidence in zip(voxel_ids, evidence_values):
+            key = (int(voxel[0]), int(voxel[1]), int(voxel[2]))
+            entry = self._match_evidence.setdefault(key, [0.0, 0])
+            entry[0] += float(evidence)
+            entry[1] += 1
+
+    def get_match_evidence(self, node_ids=None):
+        """Return accumulated match evidence for graph nodes.
+
+        Args:
+            node_ids: Indices of nodes to look up. If None, all nodes in the
+                graph are looked up.
+
+        Returns:
+            Tuple of (evidence_sums, counts) arrays, one entry per requested
+            node. Nodes whose voxel was never annotated get np.nan / 0.
+        """
+        if self._graph is None:
+            return np.array([]), np.array([], dtype=int)
+        positions = np.asarray(self.pos)
+        if node_ids is not None:
+            positions = positions[np.asarray(node_ids, dtype=int)]
+        evidence_sums = np.full(len(positions), np.nan)
+        counts = np.zeros(len(positions), dtype=int)
+        if (
+            not self._match_evidence
+            or getattr(self, "_location_scale_factor", None) is None
+        ):
+            return evidence_sums, counts
+        voxel_ids = self._locations_to_grid_ids(positions)
+        for i, voxel in enumerate(voxel_ids):
+            entry = self._match_evidence.get(
+                (int(voxel[0]), int(voxel[1]), int(voxel[2]))
+            )
+            if entry is not None:
+                evidence_sums[i] = entry[0]
+                counts[i] = entry[1]
+        return evidence_sums, counts
 
     # ------------------ Getters & Setters ---------------------
     def set_graph(self, graph):

@@ -370,7 +370,11 @@ class BurstSamplingHypothesesUpdater:
         if self.include_telemetry:
             telemetry = asdict(
                 BurstSamplingTelemetry(
-                    displacer_telemetry=displacer_telemetry,
+                    # Strip the (potentially large) match info from the logged
+                    # displacer telemetry; it is passed separately below.
+                    displacer_telemetry=HypothesisDisplacerTelemetry(
+                        mlh_prediction_error=displacer_telemetry.mlh_prediction_error,
+                    ),
                     added_ids=(
                         np.arange(len(hypotheses_update.evidence))[
                             -len(new_hypotheses.evidence) :
@@ -388,6 +392,13 @@ class BurstSamplingHypothesesUpdater:
             telemetry = {
                 "mlh_prediction_error": displacer_telemetry.mlh_prediction_error,
             }
+
+        # Which model nodes the tested hypotheses matched against this step.
+        # Consumed (and removed) by the LM for model annotation; not logged.
+        # Retained (displaced) hypotheses occupy the head of the concatenated
+        # hypothesis array, so the tested hypothesis ids remain valid indices
+        # into hypotheses_update.
+        telemetry["channel_match_info"] = displacer_telemetry.channel_match_info
 
         return hypotheses_update, telemetry
 

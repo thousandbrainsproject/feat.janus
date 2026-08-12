@@ -330,6 +330,14 @@ class EvidenceGraphLM(GraphLM):
         self.symmetry_evidence = 0
         self._hypotheses = {}
         self._persistent_object_ids: list[str] = []
+        # Persistent hypotheses (and their ids per graph) cached once per matching
+        # step by _update_possible_matches and consumed by
+        # update_terminal_condition and _annotate_matched_nodes.
+        self._persistent_hypotheses: dict[str, Hypotheses] = {}
+        self._persistent_hypothesis_ids: dict[str, npt.NDArray[np.int64]] = {}
+        # Per graph_id info about which model nodes were matched by the tested
+        # hypotheses at the most recent step (popped from updater telemetry).
+        self._latest_match_info: dict[str, dict] = {}
 
         self.hypotheses_updater.reset()  # FIXME: move reset() logic to __init__()
 
@@ -588,6 +596,14 @@ class EvidenceGraphLM(GraphLM):
         max evidence stays >90% stable for required_symmetry_evidence consecutive
         observed steps. Returns {} until then.
 
+        Note:
+            This method mutates state (the possible masks and the symmetry
+            counter) and must only be called once per matching step. It is called
+            from _update_possible_matches; update_terminal_condition consumes the
+            cached result. Alongside the returned hypotheses, the selected
+            hypothesis ids per graph are cached in _persistent_hypothesis_ids
+            (used for model annotation).
+
         Returns:
             The persistent hypotheses per object, or an empty dict if persistence
             has not yet been established.
@@ -598,6 +614,7 @@ class EvidenceGraphLM(GraphLM):
             # forgotten, mirroring the old per-object implementation).
             for hyps in self._hypotheses.values():
                 hyps.possible[:] = False
+            self._persistent_hypothesis_ids = {}
             return {}
 
         current = {
@@ -624,7 +641,9 @@ class EvidenceGraphLM(GraphLM):
                 hyps.possible[selected[graph_id]] = True
 
         if not persistence_detected:
+            self._persistent_hypothesis_ids = {}
             return {}
+        self._persistent_hypothesis_ids = selected
         return {
             graph_id: Hypotheses(
                 evidence=self._hypotheses[graph_id].evidence[ids],
@@ -839,6 +858,15 @@ class EvidenceGraphLM(GraphLM):
             self.possible_matches = self._threshold_possible_matches()
             self.previous_mlh = self.current_mlh
             self.current_mlh = self._calculate_most_likely_hypothesis()
+            # Evaluate the persistence ("high confidence") condition once per
+            # matching step, decoupled from the terminal condition check which
+            # Monty only runs after min steps. update_terminal_condition consumes
+            # this cached result so the symmetry counter is not incremented twice.
+            self._persistent_hypotheses = self.get_persistent_hypotheses()
+            # Once the LM is confident (persistent hypotheses narrowed down to a
+            # single object), annotate the model points near the active
+            # hypotheses with the evidence they matched by.
+            self._annotate_matched_nodes()
 
     def _update_evidence(
         self,
@@ -884,6 +912,16 @@ class EvidenceGraphLM(GraphLM):
         )
 
         if hypotheses_update_telemetry is not None:
+            # Extract the match info (which model nodes were matched by the
+            # tested hypotheses) so the large arrays don't end up in the logged
+            # telemetry. Used by _annotate_matched_nodes.
+            match_info = hypotheses_update_telemetry.pop("channel_match_info", None)
+            if match_info:
+                self._latest_match_info[graph_id] = match_info
+            else:
+                # No hypotheses were displaced this step (e.g. initial step), so
+                # any previous match info is stale.
+                self._latest_match_info.pop(graph_id, None)
             self.hypotheses_updater_telemetry[graph_id] = hypotheses_update_telemetry
 
         if hypotheses_update is not None:
@@ -900,6 +938,47 @@ class EvidenceGraphLM(GraphLM):
             assert not np.isnan(np.max(graph_evidence)), "evidence contains NaN."
             logger_msg += f" New max evidence: {np.round(np.max(graph_evidence), 3)}"
         logger.debug(logger_msg)
+
+    def _annotate_matched_nodes(self) -> None:
+        """Annotate model points near the active hypotheses with match evidence.
+
+        Only runs once the LM has reached high confidence, i.e. the persistent
+        hypothesis set (cached by get_persistent_hypotheses this step) has been
+        narrowed down to a single object - either a single hypothesis or a set of
+        symmetric hypotheses. For every model point that was matched against one
+        of these hypotheses this step (a nearest neighbor within
+        max_match_distance of the hypothesis' search location), the evidence it
+        matched by (positive if it matched well, negative if poorly) is
+        accumulated into the object model's metadata.
+        """
+        if len(self._persistent_hypothesis_ids) != 1:
+            return
+        graph_id, persistent_ids = next(iter(self._persistent_hypothesis_ids.items()))
+        match_info = self._latest_match_info.get(graph_id)
+        if not match_info:
+            return
+        for channel, info in match_info.items():
+            # Rows of the tested hypotheses that belong to the persistent set.
+            rows = np.flatnonzero(np.isin(info.tested_hyp_ids, persistent_ids))
+            if rows.size == 0:
+                continue
+            # Only annotate model points within the match radius of a persistent
+            # hypothesis; points further away were not compared against it.
+            in_radius = info.in_radius[rows]
+            node_ids = info.nearest_node_ids[rows][in_radius]
+            evidence_values = info.per_neighbor_evidence[rows][in_radius]
+            if node_ids.size == 0:
+                continue
+            self.graph_memory.annotate_match_evidence(
+                graph_id=graph_id,
+                input_channel=channel,
+                node_ids=node_ids.ravel(),
+                evidence_values=evidence_values.ravel(),
+            )
+            logger.debug(
+                f"Annotated {node_ids.size} matched nodes on {graph_id} "
+                f"({channel}) with match evidence."
+            )
 
     def _update_evidence_with_vote(self, votes: list[Message], graph_id):
         """Use incoming votes to update all hypotheses."""
@@ -1159,8 +1238,11 @@ class EvidenceGraphLM(GraphLM):
         for old_id in old_ids:
             self._hypotheses.pop(old_id, None)
             self.hypotheses_updater_telemetry.pop(old_id, None)
+            self._latest_match_info.pop(old_id, None)
         self.symmetry_evidence = 0
         self._persistent_object_ids = []
+        self._persistent_hypotheses = {}
+        self._persistent_hypothesis_ids = {}
 
         self.graph_memory.initialize_feature_arrays()
 
@@ -1236,7 +1318,10 @@ class EvidenceGraphLM(GraphLM):
                     self.buffer.get_current_location(input_channel="first")
                 )
         elif self.buffer.get_num_observations_on_object() > 0:
-            persistent = self.get_persistent_hypotheses()
+            # Consume the persistence result cached by _update_possible_matches
+            # this step. Calling get_persistent_hypotheses here again would
+            # increment the symmetry counter twice per step.
+            persistent = self._persistent_hypotheses
             self._persistent_object_ids = list(persistent.keys())
             if not persistent:
                 if self.terminal_state == "match":

@@ -65,6 +65,22 @@ class EvidenceGraphMemory(GraphMemory):
         num_nodes = len(node_directions)
         return node_directions.reshape((num_nodes, 3, 3))
 
+    def annotate_match_evidence(
+        self, graph_id, input_channel, node_ids, evidence_values
+    ) -> None:
+        """Accumulate match-evidence metadata on a graph's stored model points.
+
+        Args:
+            graph_id: ID of the graph to annotate.
+            input_channel: Identifier of the input channel.
+            node_ids: Indices of the nodes in the graph to annotate.
+            evidence_values: Evidence value each node matched by (one per node
+                id, can be positive or negative).
+        """
+        self.get_graph(graph_id, input_channel).annotate_match_evidence(
+            node_ids, evidence_values
+        )
+
     def get_features_by_name(
         self, graph_id: str, input_channel: str
     ) -> dict[str, np.ndarray]:
@@ -127,6 +143,11 @@ class EvidenceGraphMemory(GraphMemory):
                         channel_model._location_grid = (
                             channel_model._location_grid.coalesce()
                         )
+
+                # Models saved before match-evidence annotation was introduced
+                # don't have the metadata store yet.
+                if not hasattr(channel_model, "_match_evidence"):
+                    channel_model._match_evidence = {}
 
                 logger.info(f"Loaded {model} for {input_channel}")
                 self.models_in_memory[graph_id][input_channel] = channel_model

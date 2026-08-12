@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from tbp.monty.frameworks.models.graph_matching import GraphLM
 
 __all__ = [
+    "DenseExplorationGoalGenerator",
     "EvidenceGoalGenerator",
     "GraphGoalGenerator",
     "ParentLMNotProvided",
@@ -1009,3 +1010,91 @@ class EvidenceGoalGenerator(GraphGoalGenerator):
             an output Goal was generated.
         """
         return self.parent_lm.buffer.get_num_steps_post_output_goal_generated()
+
+
+class DenseExplorationGoalGenerator(EvidenceGoalGenerator):
+    """GSG implementing a dense-exploration model-based policy.
+
+    Instead of the hypothesis-testing policy, this policy targets points in the
+    model of the current most-likely object that have not yet been annotated
+    with match evidence, ensuring all model points are efficiently visited (and
+    thereby annotated). Among the unannotated points, the one nearest to the
+    current most-likely-hypothesis location is chosen, minimizing travel and
+    sweeping out contiguous unexplored regions.
+
+    Unlike the hypothesis-testing policy, this policy can output a Goal on
+    every step rather than waiting for particular conditions to be met.
+    """
+
+    # ======================= Private ==========================
+
+    # ------------------- Main Algorithm -----------------------
+
+    def _check_need_new_output_goal(
+        self,
+        ctx: RuntimeContext,  # noqa: ARG002
+        output_goal_achieved,  # noqa: ARG002
+    ) -> bool:
+        """Determine whether the GSG should generate a new output Goal.
+
+        Returns:
+            Always True; the dense-exploration policy may emit a Goal on every
+            step (whether a meaningful Goal is available is determined in
+            _generate_goal).
+        """
+        return True
+
+    def _generate_goal(self, observations) -> Goal | None:
+        """Generate a Goal targeting the nearest unannotated model point.
+
+        Returns:
+            A Goal for the motor system, or the None Goal if there is no
+            most-likely object model yet or all of its points have already
+            been annotated.
+        """
+        target_loc_id = self._nearest_unannotated_node()
+        if target_loc_id is None:
+            return self._generate_none_goal()
+
+        target_info = self._get_target_loc_info(target_loc_id)
+
+        goal_confidence = self.parent_lm.get_output().confidence
+
+        return self._compute_goal_for_target_loc(
+            observations,
+            target_info,
+            goal_confidence=goal_confidence,
+        )
+
+    def _nearest_unannotated_node(self) -> int | None:
+        """Find the unannotated model point nearest to the current MLH location.
+
+        Looks up the match-evidence annotations of the current most-likely
+        object's model (first sensory input channel) and selects, among the
+        points that have never been annotated, the one closest to the current
+        most-likely-hypothesis location (both expressed in the model's
+        reference frame).
+
+        Returns:
+            The index of the target node in the MLH object's graph, or None if
+            there is no most-likely object model yet or all of its points have
+            been annotated.
+        """
+        mlh = self.parent_lm.get_current_mlh()
+        graph_id = mlh["graph_id"]
+        if graph_id not in self.parent_lm.get_all_known_object_ids():
+            # No meaningful MLH yet (e.g. at the start of an episode).
+            return None
+
+        sensor_channel_name = self.parent_lm.buffer.get_first_sensory_input_channel()
+        model = self.parent_lm.get_graph(graph_id)[sensor_channel_name]
+        _, counts = model.get_match_evidence()
+        unannotated = np.flatnonzero(counts == 0)
+        if unannotated.size == 0:
+            return None
+
+        unannotated_locs = np.asarray(model.pos)[unannotated]
+        distances = np.linalg.norm(
+            unannotated_locs - np.asarray(mlh["location"]), axis=1
+        )
+        return int(unannotated[np.argmin(distances)])

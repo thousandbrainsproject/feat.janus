@@ -210,6 +210,17 @@ class EvidenceGraphLM(GraphLM):
             voxel. All locations that fall into the same voxel will be averaged and
             represented as one value. num_model_voxels_per_dim should not be too large
             since the memory requirements grow cubically with this number.
+        split_bimodality_threshold: Minimum Ashman's D between the two clusters
+            of a fully annotated model's match-evidence values for the
+            distribution to be considered bimodal and the model to be split
+            into two component graphs. Note the clusters are obtained by a hard
+            2-means partition, whose truncated within-cluster spreads inflate
+            the measured D relative to the textbook statistic (a unimodal
+            Gaussian measures ~2.6, a uniform distribution ~3.5), hence the
+            default of 4.0 rather than the classic 2.0.
+        split_min_cluster_fraction: Minimum fraction of a fully annotated
+            model's points that each evidence cluster must contain for the
+            model to be split.
         gsg: The goal generator to associate with the LM.
         hypotheses_updater_class: The type of hypotheses updater to associate with the
             LM.
@@ -253,6 +264,8 @@ class EvidenceGraphLM(GraphLM):
         max_nodes_per_graph=2000,
         num_model_voxels_per_dim=50,  # -> voxel size = 6mm3 (0.006)
         use_multithreading=True,
+        split_bimodality_threshold=4.0,
+        split_min_cluster_fraction=0.1,
         gsg: EvidenceGoalGenerator | None = None,
         hypotheses_updater_class: type[HypothesesUpdater] = DefaultHypothesesUpdater,
         hypotheses_updater_args: dict | None = None,
@@ -290,6 +303,9 @@ class EvidenceGraphLM(GraphLM):
         self.path_similarity_threshold = path_similarity_threshold
         self.pose_similarity_threshold = pose_similarity_threshold
         self.required_symmetry_evidence = required_symmetry_evidence
+        # --- Model Splitting Params ---
+        self.split_bimodality_threshold = split_bimodality_threshold
+        self.split_min_cluster_fraction = split_min_cluster_fraction
         # --- Model Params ---
         self.max_graph_size = max_graph_size
         # --- Debugging Params ---
@@ -867,6 +883,10 @@ class EvidenceGraphLM(GraphLM):
             # single object), annotate the model points near the active
             # hypotheses with the evidence they matched by.
             self._annotate_matched_nodes()
+            # If every point of the recognized model is now annotated, check
+            # whether the evidence distribution is bimodal and, if so, split
+            # the model into two component graphs.
+            self._maybe_split_memory()
 
     def _update_evidence(
         self,
@@ -952,8 +972,8 @@ class EvidenceGraphLM(GraphLM):
         into an exponential moving average stored in the object model's
         metadata.
         """
-        if len(self._persistent_hypothesis_ids) != 1:
-            return
+        # if len(self._persistent_hypothesis_ids) != 1:
+        #     return
         graph_id, persistent_ids = next(iter(self._persistent_hypothesis_ids.items()))
         match_info = self._latest_match_info.get(graph_id)
         logger.info("Annotating match info!")
@@ -981,6 +1001,175 @@ class EvidenceGraphLM(GraphLM):
                 f"Annotated {node_ids.size} matched nodes on {graph_id} "
                 f"({channel}) with match evidence."
             )
+
+    def _maybe_split_memory(self) -> None:
+        """Split the recognized graph in two if its match evidence is bimodal.
+
+        Only considered once the persistent hypothesis set has been narrowed
+        down to a single graph and every point of that graph (across all input
+        channels) has been annotated with match evidence. If the distribution
+        of the annotated evidence values is approximately bimodal (see
+        _compute_bimodal_split_boundary), the graph is split into two component
+        graphs, one per evidence mode. The components share the source graph's
+        reference frame and their points need not be contiguous in space.
+        """
+        if len(self._persistent_hypothesis_ids) != 1:
+            return
+        graph_id = next(iter(self._persistent_hypothesis_ids))
+        if graph_id not in self.graph_memory.get_memory_ids():
+            return
+
+        evidence_per_channel = {}
+        for channel in self.graph_memory.get_input_channels_in_graph(graph_id):
+            evidence_means, counts = self.graph_memory.get_graph(
+                graph_id, channel
+            ).get_match_evidence()
+            if len(evidence_means) == 0 or np.any(counts == 0):
+                # Not all model points have been annotated yet.
+                return
+            evidence_per_channel[channel] = evidence_means
+
+        pooled_evidence = np.concatenate(list(evidence_per_channel.values()))
+        boundary = self._compute_bimodal_split_boundary(pooled_evidence)
+        if boundary is None:
+            return
+
+        # Component 1 is the higher-evidence mode, component 2 the lower one.
+        node_ids_per_channel = {}
+        for channel, evidence_means in evidence_per_channel.items():
+            high_ids = np.flatnonzero(evidence_means > boundary)
+            low_ids = np.flatnonzero(evidence_means <= boundary)
+            if high_ids.size == 0 or low_ids.size == 0:
+                logger.info(
+                    f"All of {graph_id}'s points in channel {channel} fall on "
+                    "one side of the evidence boundary; skipping split."
+                )
+                return
+            node_ids_per_channel[channel] = [high_ids, low_ids]
+
+        # Ensure the component ids do not collide with existing graphs so that
+        # registration cannot silently overwrite an existing entry.
+        new_graph_ids = [
+            f"{graph_id}_component_1",
+            f"{graph_id}_component_2",
+        ]
+        existing_ids = set(self.graph_memory.get_memory_ids())
+        while any(new_id in existing_ids for new_id in new_graph_ids):
+            new_graph_ids = [f"{new_id}_split" for new_id in new_graph_ids]
+
+        split = self.graph_memory._split_graph(
+            graph_id=graph_id,
+            node_ids_per_channel=node_ids_per_channel,
+            new_graph_ids=new_graph_ids,
+        )
+        if split:
+            self._cleanup_after_split(graph_id, new_graph_ids)
+            logger.info(
+                f"{self.learning_module_id} split {graph_id} into "
+                f"{new_graph_ids} (evidence boundary {np.round(boundary, 3)})."
+            )
+
+    def _compute_bimodal_split_boundary(self, evidence_values) -> float | None:
+        """Return the evidence boundary between two modes, if bimodal.
+
+        The values are clustered with 1-D 2-means (Lloyd's algorithm). The
+        distribution is considered approximately bimodal if the clusters are
+        well separated according to Ashman's D
+        (sqrt(2) * |mu1 - mu2| / sqrt(s1^2 + s2^2) > split_bimodality_threshold)
+        and each cluster contains at least split_min_cluster_fraction of the
+        values. Since the clusters come from a hard partition (rather than a
+        fitted mixture), their truncated spreads inflate D compared to the
+        textbook statistic; split_bimodality_threshold's default accounts for
+        this.
+
+        Args:
+            evidence_values: The annotated evidence values of all model points.
+
+        Returns:
+            The boundary separating the two modes, or None if the distribution
+            is not approximately bimodal.
+        """
+        values = np.asarray(evidence_values, dtype=float)
+        if len(values) < 4 or np.isclose(values.min(), values.max()):
+            return None
+
+        # 1-D 2-means: seed the centers with the extremes and iterate.
+        center_low, center_high = float(values.min()), float(values.max())
+        boundary = (center_low + center_high) / 2
+        for _ in range(100):
+            lower = values[values <= boundary]
+            upper = values[values > boundary]
+            if len(lower) == 0 or len(upper) == 0:
+                return None
+            new_low, new_high = lower.mean(), upper.mean()
+            if np.isclose(new_low, center_low) and np.isclose(new_high, center_high):
+                break
+            center_low, center_high = new_low, new_high
+            boundary = (center_low + center_high) / 2
+
+        lower = values[values <= boundary]
+        upper = values[values > boundary]
+        min_cluster_size = self.split_min_cluster_fraction * len(values)
+        if len(lower) < min_cluster_size or len(upper) < min_cluster_size:
+            return None
+
+        spread = np.sqrt(lower.std() ** 2 + upper.std() ** 2)
+        if spread == 0:
+            # Two distinct point masses: infinitely separated relative to
+            # their (zero) spread.
+            ashman_d = np.inf
+        else:
+            ashman_d = np.sqrt(2) * np.abs(upper.mean() - lower.mean()) / spread
+        logger.debug(
+            f"Bimodality check: Ashman's D = {np.round(ashman_d, 3)} "
+            f"(threshold {self.split_bimodality_threshold})."
+        )
+        if ashman_d < self.split_bimodality_threshold:
+            return None
+        return float(boundary)
+
+    def _cleanup_after_split(self, old_graph_id: str, new_graph_ids: list[str]) -> None:
+        """Remove all stale references to the split-away graph.
+
+        Since the component graphs share the source graph's reference frame,
+        the source graph's hypotheses (locations and poses) remain valid
+        candidates for both components and are carried over. Evidence for the
+        two components will diverge with subsequent observations.
+
+        Args:
+            old_graph_id: ID of the graph that was split and deleted.
+            new_graph_ids: IDs of the resulting component graphs.
+        """
+        old_hypotheses = self._hypotheses.pop(old_graph_id, Hypotheses.empty())
+        self.hypotheses_updater_telemetry.pop(old_graph_id, None)
+        self._latest_match_info.pop(old_graph_id, None)
+        self.symmetry_evidence = 0
+        self._persistent_object_ids = []
+        self._persistent_hypotheses = {}
+        self._persistent_hypothesis_ids = {}
+
+        self.graph_memory.initialize_feature_arrays()
+
+        # Both components inherit the ground-truth target labels of the source.
+        old_targets = self.graph_id_to_target.pop(old_graph_id, set())
+        for new_graph_id in new_graph_ids:
+            if old_targets:
+                self.graph_id_to_target[new_graph_id] = set(old_targets)
+        for target, graph_ids in self.target_to_graph_id.items():
+            if old_graph_id in graph_ids:
+                remaining_ids = graph_ids.difference({old_graph_id})
+                remaining_ids.update(new_graph_ids)
+                self.target_to_graph_id[target] = remaining_ids
+
+        for new_graph_id in new_graph_ids:
+            self._hypotheses[new_graph_id] = Hypotheses(
+                evidence=old_hypotheses.evidence.copy(),
+                locations=old_hypotheses.locations.copy(),
+                poses=old_hypotheses.poses.copy(),
+                possible=old_hypotheses.possible.copy(),
+            )
+        self.possible_matches = self._threshold_possible_matches()
+        self.current_mlh = self._calculate_most_likely_hypothesis()
 
     def _update_evidence_with_vote(self, votes: list[Message], graph_id):
         """Use incoming votes to update all hypotheses."""

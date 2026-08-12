@@ -17,7 +17,10 @@ from tbp.monty.frameworks.experiments.mode import ExperimentMode
 from tbp.monty.frameworks.models.evidence_matching.learning_module import (
     EvidenceGraphLM,
 )
-from tbp.monty.frameworks.models.goal_generation import EvidenceGoalGenerator
+from tbp.monty.frameworks.models.goal_generation import (
+    DenseExplorationGoalGenerator,
+    EvidenceGoalGenerator,
+)
 from tests.unit.resources.unit_test_utils import BaseGraphTest
 
 
@@ -752,4 +755,302 @@ class EvidenceLMTest(BaseGraphTest):
             list(graph_lm.get_current_mlh()["rotation"].as_euler("xyz", degrees=True)),
             [0, 0, 0],
             "Should recognize rotation 0, 0, 0.",
+        )
+
+    # =================== Model splitting ===================
+
+    def test_bimodal_evidence_distribution_detected(self):
+        """A clearly bimodal distribution yields a boundary between the modes."""
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        rng = np.random.RandomState(42)
+        low_mode = rng.normal(-2.0, 0.1, 50)
+        high_mode = rng.normal(2.0, 0.1, 50)
+
+        boundary = graph_lm._compute_bimodal_split_boundary(
+            np.concatenate([low_mode, high_mode])
+        )
+
+        self.assertIsNotNone(
+            boundary,
+            "A distribution with two well-separated modes should be "
+            "detected as bimodal.",
+        )
+        self.assertGreater(
+            boundary,
+            low_mode.max(),
+            "The split boundary should lie above the lower mode.",
+        )
+        self.assertLess(
+            boundary,
+            high_mode.min(),
+            "The split boundary should lie below the upper mode.",
+        )
+
+    def test_unimodal_evidence_distribution_not_split(self):
+        """Unimodal distributions should not be considered bimodal."""
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        rng = np.random.RandomState(42)
+
+        self.assertIsNone(
+            graph_lm._compute_bimodal_split_boundary(rng.normal(0.0, 1.0, 200)),
+            "A Gaussian distribution should not be detected as bimodal.",
+        )
+        self.assertIsNone(
+            graph_lm._compute_bimodal_split_boundary(rng.uniform(-1.0, 1.0, 200)),
+            "A uniform distribution should not be detected as bimodal.",
+        )
+        self.assertIsNone(
+            graph_lm._compute_bimodal_split_boundary(np.ones(10)),
+            "Constant values should not be detected as bimodal.",
+        )
+
+    def test_tiny_cluster_does_not_trigger_split(self):
+        """A few outliers should not count as a second mode."""
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        rng = np.random.RandomState(42)
+        values = np.concatenate([rng.normal(0.0, 0.05, 97), np.full(3, 5.0)])
+
+        self.assertIsNone(
+            graph_lm._compute_bimodal_split_boundary(values),
+            "A cluster holding less than split_min_cluster_fraction of the "
+            "values should not trigger a split.",
+        )
+
+    def test_split_graph_partitions_model(self):
+        """_split_graph divides a graph's nodes into two component graphs."""
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        memory = graph_lm.graph_memory
+        model = memory.get_graph("new_object0", "patch")
+        pos = np.asarray(model.pos).copy()
+        n_nodes = pos.shape[0]
+        self.assertGreaterEqual(n_nodes, 4, "Should have learned all 4 points.")
+        first_ids = np.array([0, 1])
+        second_ids = np.arange(2, n_nodes)
+
+        success = memory._split_graph(
+            graph_id="new_object0",
+            node_ids_per_channel={"patch": [first_ids, second_ids]},
+            new_graph_ids=["new_object0_component_1", "new_object0_component_2"],
+        )
+
+        self.assertTrue(success, "The split should succeed.")
+        self.assertNotIn(
+            "new_object0",
+            memory.get_memory_ids(),
+            "The source graph should be removed from memory.",
+        )
+        for component_id, node_ids in [
+            ("new_object0_component_1", first_ids),
+            ("new_object0_component_2", second_ids),
+        ]:
+            self.assertIn(
+                component_id,
+                memory.get_memory_ids(),
+                f"{component_id} should be registered in memory.",
+            )
+            component_model = memory.get_graph(component_id, "patch")
+            component_pos = np.asarray(component_model.pos)
+            self.assertEqual(
+                component_pos.shape[0],
+                len(node_ids),
+                f"{component_id} should contain exactly its subset of nodes.",
+            )
+            for location in pos[node_ids]:
+                self.assertTrue(
+                    np.any(np.all(np.isclose(component_pos, location), axis=1)),
+                    f"{component_id} should contain the source location "
+                    f"{location} unchanged (same reference frame).",
+                )
+            self.assertEqual(
+                component_model._match_evidence,
+                {},
+                "Component models should start with empty match-evidence "
+                "metadata.",
+            )
+
+    def test_model_splits_after_full_bimodal_annotation(self):
+        """A fully annotated model with bimodal evidence is split in two.
+
+        Runs matching steps until the persistence ("high confidence")
+        condition is met, then overwrites the model's annotations with a
+        bimodal distribution covering all points. The next matching step
+        should detect this and split the model into two component graphs.
+        """
+        fake_obs_test = copy.deepcopy(self.fake_obs_learn)
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        graph_lm.required_symmetry_evidence = 3
+        # Prevent a split while the persistence condition is being reached.
+        graph_lm.split_bimodality_threshold = np.inf
+
+        graph_lm.mode = ExperimentMode.EVAL
+        graph_lm.reset_stm()
+        graph_lm.fixme_reset_ground_truth(primary_target=self.placeholder_target)
+
+        for step in range(12):
+            observation = fake_obs_test[step % 4]
+            graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+            graph_lm.matching_step(self.ctx, [observation])
+        self.assertListEqual(
+            list(graph_lm._persistent_hypothesis_ids.keys()),
+            ["new_object0"],
+            "Persistent hypotheses should be narrowed down to new_object0.",
+        )
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        pos = np.asarray(model.pos).copy()
+        # The nodes at (0,0,0) and (1,0,0) form the high-evidence mode, the
+        # remaining nodes the low-evidence mode.
+        high_ids = [
+            int(np.argmin(np.linalg.norm(pos - location, axis=1)))
+            for location in (np.zeros(3), np.array([1.0, 0.0, 0.0]))
+        ]
+        low_ids = [i for i in range(pos.shape[0]) if i not in high_ids]
+        model._match_evidence.clear()
+        model.annotate_match_evidence(high_ids, [3.0] * len(high_ids))
+        model.annotate_match_evidence(low_ids, [-3.0] * len(low_ids))
+        # Freeze the annotations so the next step's annotation of matched
+        # nodes does not move them.
+        model.match_evidence_smoothing = 0.0
+        graph_lm.split_bimodality_threshold = 4.0
+
+        graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+        graph_lm.matching_step(self.ctx, [fake_obs_test[0]])
+
+        known_ids = graph_lm.get_all_known_object_ids()
+        self.assertNotIn(
+            "new_object0",
+            known_ids,
+            "The source graph should have been removed by the split.",
+        )
+        for component_id, node_ids in [
+            ("new_object0_component_1", high_ids),
+            ("new_object0_component_2", low_ids),
+        ]:
+            self.assertIn(
+                component_id,
+                known_ids,
+                f"{component_id} should be in memory after the split.",
+            )
+            component_model = graph_lm.graph_memory.get_graph(
+                component_id, "patch"
+            )
+            component_pos = np.asarray(component_model.pos)
+            self.assertEqual(
+                component_pos.shape[0],
+                len(node_ids),
+                f"{component_id} should contain its evidence mode's nodes.",
+            )
+            for location in pos[node_ids]:
+                self.assertTrue(
+                    np.any(np.all(np.isclose(component_pos, location), axis=1)),
+                    f"{component_id} should contain the source location "
+                    f"{location} unchanged (same reference frame).",
+                )
+            _, counts = component_model.get_match_evidence()
+            self.assertTrue(
+                np.all(counts == 0),
+                "Component models should start unannotated.",
+            )
+            self.assertIn(
+                component_id,
+                graph_lm._hypotheses,
+                "Components should inherit the source graph's hypotheses.",
+            )
+        self.assertEqual(
+            graph_lm.symmetry_evidence,
+            0,
+            "Symmetry evidence should be reset by the split.",
+        )
+        self.assertEqual(
+            graph_lm._persistent_hypothesis_ids,
+            {},
+            "Persistent hypotheses should be reset by the split.",
+        )
+
+    # =================== Dense exploration policy ===================
+
+    def get_elm_after_dense_exploration_steps(self, num_steps=2):
+        """Train an LM with a dense-exploration GSG and run matching steps.
+
+        Returns:
+            The learning module (with `graph_lm.gsg` set to the
+            DenseExplorationGoalGenerator).
+        """
+        gsg = DenseExplorationGoalGenerator(**self.default_gsg_config)
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn, gsg=gsg)
+
+        graph_lm.mode = ExperimentMode.EVAL
+        graph_lm.reset_stm()
+        graph_lm.fixme_reset_ground_truth(primary_target=self.placeholder_target)
+        fake_obs_test = copy.deepcopy(self.fake_obs_learn)
+        for step in range(num_steps):
+            graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+            graph_lm.matching_step(self.ctx, [fake_obs_test[step % 4]])
+        return graph_lm
+
+    def test_dense_exploration_targets_nearest_unannotated_point(self):
+        """The dense-exploration policy targets the sole unannotated point."""
+        graph_lm = self.get_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        pos = np.asarray(model.pos)
+        # Annotate every node except the one at (1,1,1).
+        target_node = int(
+            np.argmin(np.linalg.norm(pos - np.array([1.0, 1.0, 1.0]), axis=1))
+        )
+        annotated = [i for i in range(pos.shape[0]) if i != target_node]
+        model.annotate_match_evidence(annotated, [1.0] * len(annotated))
+
+        self.assertEqual(
+            gsg._nearest_unannotated_node(),
+            target_node,
+            "The only unannotated node should be selected as the target.",
+        )
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        self.assertTrue(
+            np.allclose(goal.info["proposed_surface_loc"], pos[target_node]),
+            "The Goal should target the unannotated model point (identity "
+            "pose, so model and body coordinates coincide).",
+        )
+
+    def test_dense_exploration_no_goal_when_fully_annotated(self):
+        """No Goal is produced once every model point has been annotated."""
+        graph_lm = self.get_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        n_nodes = np.asarray(model.pos).shape[0]
+        model.annotate_match_evidence(list(range(n_nodes)), [1.0] * n_nodes)
+
+        self.assertIsNone(
+            gsg._nearest_unannotated_node(),
+            "No target should be proposed when all points are annotated.",
+        )
+        self.assertIsNone(
+            gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])]),
+            "The None Goal should be generated when all points are annotated.",
+        )
+
+    def test_dense_exploration_can_generate_goal_every_step(self):
+        """The dense-exploration policy never waits to generate a new Goal."""
+        gsg = DenseExplorationGoalGenerator(**self.default_gsg_config)
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn, gsg=gsg)
+
+        self.assertTrue(
+            gsg._check_need_new_output_goal(self.ctx, output_goal_achieved=False),
+            "The policy should be able to emit a Goal on every step.",
+        )
+        self.assertTrue(
+            gsg._check_need_new_output_goal(self.ctx, output_goal_achieved=True),
+            "Achieving the previous Goal should not stop new Goals.",
+        )
+
+        # Before matching starts there is no meaningful MLH, so no target.
+        graph_lm.reset_stm()
+        self.assertIsNone(
+            gsg._nearest_unannotated_node(),
+            "No target should be proposed before matching has started.",
         )

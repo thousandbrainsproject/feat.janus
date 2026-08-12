@@ -23,6 +23,16 @@ experiment:
         # so matching steps after confidence annotate the object model with
         # match-evidence metadata before the episode can terminate.
         min_eval_steps: 300
+      learning_modules:
+        learning_module_0:
+          # Use the dense-exploration policy instead of the default
+          # hypothesis-testing policy so that all model points are visited
+          # (and thereby annotated), enabling the model-splitting check.
+          gsg:
+            _target_: tbp.monty.frameworks.models.goal_generation.DenseExplorationGoalGenerator
+            goal_tolerances:
+              location: 0.015
+            desired_object_distance: 0.03
     max_train_steps: 1000
     max_eval_steps: 500
     max_total_steps: 6000

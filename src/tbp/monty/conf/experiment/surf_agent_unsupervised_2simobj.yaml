@@ -15,9 +15,9 @@ experiment:
   _target_: tbp.monty.frameworks.experiments.object_recognition_experiments.MontyObjectRecognitionExperiment
   config:
     show_sensor_output: false
-    max_train_steps: 6000
+    max_train_steps: 15000
     max_eval_steps: 500
-    max_total_steps: 6000
+    max_total_steps: 15000
     n_train_epochs: 5
     n_eval_epochs: ${constants.rotations_all_count}
     model_name_or_path: ""

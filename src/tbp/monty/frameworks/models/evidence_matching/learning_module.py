@@ -272,7 +272,7 @@ class EvidenceGraphLM(GraphLM):
         max_nodes_per_graph=2000,
         num_model_voxels_per_dim=50,  # -> voxel size = 6mm3 (0.006)
         use_multithreading=True,
-        split_cluster_separation_threshold=4.0,
+        split_cluster_separation_threshold=2.0,
         split_min_cluster_fraction=0.1,
         split_spatial_neighbor_distance=0.005,
         gsg: EvidenceGoalGenerator | None = None,
@@ -1037,7 +1037,7 @@ class EvidenceGraphLM(GraphLM):
             ).get_match_evidence()
             if len(evidence_means) == 0 or np.any(counts == 0):
                 # Not all model points have been annotated yet.
-                logger.debug(
+                logger.info(
                     f"Not considering a split of {graph_id} ({channel}): "
                     f"{np.count_nonzero(counts)}/{len(counts)} points "
                     "annotated."
@@ -1047,8 +1047,8 @@ class EvidenceGraphLM(GraphLM):
 
         pooled_evidence = np.concatenate(list(evidence_per_channel.values()))
         if not self._detect_positive_evidence_cluster(pooled_evidence):
-            logger.debug(
-                f"No positive-evidence cluster found in {graph_id} ({channel})."
+            logger.info(
+                f"Not considered a split as no positive-evidence cluster found in {graph_id} ({channel})."
             )
             return
 

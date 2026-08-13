@@ -977,6 +977,26 @@ class EvidenceLMTest(BaseGraphTest):
             "Persistent hypotheses should be reset by the split.",
         )
 
+    def test_stats_collection_after_split_does_not_raise(self):
+        """Collecting stats works when the previous MLH's graph was split away.
+
+        When a graph is split, its hypotheses-updater telemetry is removed,
+        but `previous_mlh` may still reference the old graph id when stats
+        are collected later in the same matching step.
+        """
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        graph_lm.previous_mlh = dict(graph_lm.current_mlh)
+        graph_lm.previous_mlh["graph_id"] = "spoon"
+        self.assertNotIn("spoon", graph_lm.hypotheses_updater_telemetry)
+
+        graph_lm.collect_stats_to_save()  # Should not raise.
+
+        self.assertEqual(
+            graph_lm.buffer.stats.get("mlh_prediction_error", []),
+            [],
+            "No prediction error should be logged for a split-away graph.",
+        )
+
     # =================== Dense exploration policy ===================
 
     def get_elm_after_dense_exploration_steps(self, num_steps=2):

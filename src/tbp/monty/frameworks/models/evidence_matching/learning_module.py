@@ -1722,7 +1722,11 @@ class EvidenceGraphLM(GraphLM):
             # don't try to log prediction errors if there were no observations or LM
             # detected no match.
             return
-        graph_telemetry = self.hypotheses_updater_telemetry[graph_id]
+        # The graph may have been split or merged away this step, in which case
+        # its telemetry was removed and there is no prediction error to log.
+        graph_telemetry = self.hypotheses_updater_telemetry.get(graph_id)
+        if graph_telemetry is None:
+            return
         mlh_prediction_error = graph_telemetry.get("mlh_prediction_error")
 
         if mlh_prediction_error is not None:

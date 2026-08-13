@@ -39,6 +39,7 @@ from tbp.monty.frameworks.actions.actions import (
 from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.models.abstract_monty_classes import Observations
 from tbp.monty.frameworks.models.motor_policies import (
+    InformedPolicy,
     InformedPolicyRandomWalk,
     JumpToGoal,
     MotorPolicyResult,
@@ -345,6 +346,7 @@ class JumpToGoalTest(ParametrizedTestCase):
             morphological_features={
                 "pose_vectors": np.eye(3),
             },
+            info={},
         )
         with patch(
             "tbp.monty.frameworks.models.motor_policies.PositioningProcedure.depth_at_center"
@@ -365,6 +367,7 @@ class JumpToGoalTest(ParametrizedTestCase):
                     morphological_features={
                         "pose_vectors": np.eye(3),
                     },
+                    info={},
                 )
                 if has_post_jump_goal
                 else None
@@ -382,6 +385,10 @@ class JumpToGoalTest(ParametrizedTestCase):
         assert isinstance(policy_result, MotorPolicyResult)
         self.assertEqual(policy_result.status, PolicyStatus.READY)
         self.assertEqual(len(policy_result.actions), 2)
+        self.assertTrue(
+            goal.info["jump_failed"],
+            "The goal that initiated the undone jump should be marked failed.",
+        )
         set_agent_pose = policy_result.actions[0]
         assert isinstance(set_agent_pose, SetAgentPose)
         set_sensor_rotation = policy_result.actions[1]
@@ -404,6 +411,61 @@ class JumpToGoalTest(ParametrizedTestCase):
             observations=observations,
             sensor_id=SensorID("view_finder"),
         )
+
+    @patch(
+        "tbp.monty.frameworks.models.motor_policies.PositioningProcedure.depth_at_center",
+        return_value=1.0,
+    )
+    def test_does_not_record_outcome_when_jump_was_not_executed(
+        self,
+        depth_at_center_mock: Mock,
+    ) -> None:
+        """No outcome is recorded when the proposed jump did not run.
+
+        The proposed jump actions may be replaced before execution (e.g. by a
+        user-chosen action in an interactive session). The policy detects
+        this by the agent not being at the Goal's location and leaves the
+        Goal's outcome unrecorded, even when it undoes the (never-executed)
+        jump because the object is out of view.
+        """
+        goal = Mock(
+            location=np.array([0.5, 0.5, 0.5]),
+            morphological_features={
+                "pose_vectors": np.eye(3),
+            },
+            info={},
+        )
+        policy = JumpToGoal(self.agent_id, SensorID("view_finder"))
+        policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.motor_system_state,
+            percept=Mock(),
+            goal=goal,
+        )
+
+        # The agent is still at the origin: the jump was never executed.
+        policy_result = policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.motor_system_state,
+            percept=Mock(),
+            goal=None,
+        )
+
+        assert isinstance(policy_result, MotorPolicyResult)
+        self.assertEqual(policy_result.status, PolicyStatus.READY)
+        self.assertEqual(
+            len(policy_result.actions),
+            2,
+            "The undo actions should still be returned.",
+        )
+        self.assertNotIn(
+            "jump_failed",
+            goal.info,
+            "No outcome should be recorded for a jump that was not executed.",
+        )
+        depth_at_center_mock.assert_called_once()
 
     @given(
         goal_location=vectors_3d(min_value=-1, max_value=1, dtype=np.float64),
@@ -436,12 +498,14 @@ class JumpToGoalTest(ParametrizedTestCase):
             morphological_features={
                 "pose_vectors": np.eye(3),
             },
+            info={},
         )
         second_goal = Mock(
             location=goal_location,
             morphological_features={
                 "pose_vectors": pose_vectors,
             },
+            info={},
         )
 
         policy(
@@ -461,6 +525,12 @@ class JumpToGoalTest(ParametrizedTestCase):
         )
         assert isinstance(policy_result, MotorPolicyResult)
         self.assertEqual(policy_result.status, PolicyStatus.IN_PROGRESS)
+        self.assertIs(
+            first_goal.info["jump_failed"],
+            False,
+            "The goal that initiated the successful jump should not be "
+            "marked failed.",
+        )
 
         self.assertEqual(len(policy_result.actions), 2)
         set_agent_pose = policy_result.actions[0]
@@ -510,6 +580,7 @@ class JumpToGoalTest(ParametrizedTestCase):
             morphological_features={
                 "pose_vectors": np.eye(3),
             },
+            info={},
         )
 
         policy = JumpToGoal(self.agent_id, SensorID("view_finder"))
@@ -538,6 +609,164 @@ class JumpToGoalTest(ParametrizedTestCase):
             observations=observations,
             sensor_id=SensorID("view_finder"),
         )
+
+
+class InformedPolicyJumpOutcomeTest(unittest.TestCase):
+    """Test that InformedPolicy records jump outcomes on the driving Goal."""
+
+    def setUp(self) -> None:
+        self.agent_id = AGENT_ID
+        self.policy = InformedPolicy(
+            use_goal_driven_actions=True,
+            action_sampler=UniformlyDistributedSampler(actions=[LookUp]),
+            agent_id=self.agent_id,
+        )
+        self.state = MotorSystemState(
+            {
+                self.agent_id: AgentState(
+                    sensors={
+                        SensorID("sensor_id_0"): SensorState(
+                            position=cast("VectorXYZ", (0, 0, 0)),
+                            rotation=qt.one,
+                        )
+                    },
+                    position=cast("VectorXYZ", (0, 0, 0)),
+                    rotation=qt.one,
+                )
+            }
+        )
+        self.goal = Mock(
+            location=np.zeros(3),
+            morphological_features={
+                "pose_vectors": np.eye(3),
+            },
+            info={},
+        )
+
+    def _percept_off_object(self) -> Mock:
+        percept = Mock()
+        percept.get_on_object.return_value = False
+        return percept
+
+    @patch(
+        "tbp.monty.frameworks.models.motor_policies.PositioningProcedure.depth_at_center",
+        return_value=1.0,
+    )
+    def test_marks_goal_failed_when_jump_is_undone(
+        self,
+        depth_at_center_mock: Mock,
+    ) -> None:
+        self.policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.state,
+            percept=self._percept_off_object(),
+            goal=self.goal,
+        )
+
+        result = self.policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.state,
+            percept=self._percept_off_object(),
+            goal=None,
+        )
+
+        self.assertIs(
+            self.goal.info["jump_failed"],
+            True,
+            "The goal that initiated the undone jump should be marked failed.",
+        )
+        self.assertEqual(
+            len(result.actions),
+            2,
+            "The undo jump actions should be returned.",
+        )
+        depth_at_center_mock.assert_called_once()
+
+    @patch(
+        "tbp.monty.frameworks.models.motor_policies.PositioningProcedure.depth_at_center",
+        return_value=0.99,
+    )
+    def test_marks_goal_not_failed_when_jump_succeeds(
+        self,
+        depth_at_center_mock: Mock,
+    ) -> None:
+        self.policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.state,
+            percept=self._percept_off_object(),
+            goal=self.goal,
+        )
+
+        self.policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.state,
+            percept=self._percept_off_object(),
+            goal=None,
+        )
+
+        self.assertIs(
+            self.goal.info["jump_failed"],
+            False,
+            "The goal that initiated the successful jump should not be "
+            "marked failed.",
+        )
+        depth_at_center_mock.assert_called_once()
+
+    @patch(
+        "tbp.monty.frameworks.models.motor_policies.PositioningProcedure.depth_at_center",
+        return_value=1.0,
+    )
+    def test_does_not_record_outcome_when_jump_was_not_executed(
+        self,
+        depth_at_center_mock: Mock,
+    ) -> None:
+        """No outcome is recorded when the proposed jump did not run.
+
+        The proposed jump actions may be replaced before execution (e.g. by a
+        user-chosen action in an interactive session). The policy detects
+        this by the agent not being at the Goal's location and leaves the
+        Goal's outcome unrecorded, even when it undoes the (never-executed)
+        jump because the object is out of view.
+        """
+        goal = Mock(
+            location=np.array([0.5, 0.5, 0.5]),
+            morphological_features={
+                "pose_vectors": np.eye(3),
+            },
+            info={},
+        )
+        self.policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.state,
+            percept=self._percept_off_object(),
+            goal=goal,
+        )
+
+        # The agent is still at the origin: the jump was never executed.
+        result = self.policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=self.state,
+            percept=self._percept_off_object(),
+            goal=None,
+        )
+
+        self.assertNotIn(
+            "jump_failed",
+            goal.info,
+            "No outcome should be recorded for a jump that was not executed.",
+        )
+        self.assertEqual(
+            len(result.actions),
+            2,
+            "The undo jump actions should still be returned.",
+        )
+        depth_at_center_mock.assert_called_once()
 
 
 class InformedPolicyRandomWalkTest(unittest.TestCase):

@@ -80,6 +80,36 @@ class NoGoalProvided(RuntimeError):
     pass
 
 
+def _jump_was_executed(
+    state: MotorSystemState, agent_id: AgentID, goal: Goal | None
+) -> bool:
+    """Whether a previously proposed jump to `goal` was actually enacted.
+
+    Proposed jump actions are not always executed (e.g. an interactive
+    session may replace the proposed actions with a user-chosen action), and
+    the policy cannot observe which actions ran. Since a jump teleports the
+    agent exactly to the Goal's location, the jump was executed if and only
+    if the agent is at that location now.
+
+    Args:
+        state: The current state of the motor system.
+        agent_id: The agent the jump would have moved.
+        goal: The Goal the jump was computed for, if any.
+
+    Returns:
+        True when the agent's position matches the Goal's location.
+    """
+    if goal is None or goal.location is None:
+        return False
+    return bool(
+        np.allclose(
+            np.asarray(state[agent_id].position, dtype=float),
+            np.asarray(goal.location, dtype=float),
+            atol=1e-6,
+        )
+    )
+
+
 @dataclass
 class SurfacePolicyTelemetry:
     """Telemetry class used by SurfacePolicy."""
@@ -446,6 +476,7 @@ class JumpToGoal(MotorPolicy):
     _is_jumping: bool
     _pre_jump_state: AgentState | None
     _undo_actions: list[Action]
+    _jump_goal: Goal | None
 
     def __init__(self, agent_id: AgentID, sensor_id: SensorID) -> None:
         """Initialize policy.
@@ -536,7 +567,7 @@ class JumpToGoal(MotorPolicy):
           - But if goal is None and we didn't just jump, that's an error.
         """
         if self._is_jumping:
-            result = self._maybe_undo(observations)
+            result = self._maybe_undo(observations, state)
             if result is not None:
                 return result
             if not goal:
@@ -556,19 +587,32 @@ class JumpToGoal(MotorPolicy):
     def _maybe_undo(
         self,
         observations: Observations,
+        state: MotorSystemState,
     ) -> MotorPolicyResult | None:
         """Handle the outcome of a jump.
 
+        The outcome is recorded on the Goal that initiated the jump
+        (`goal.info["jump_failed"]`) so that the sender of the Goal (e.g. an
+        LM's GSG) can react to failed jumps. It is only recorded when the
+        jump was actually executed (the agent is at the Goal's location);
+        the proposed jump actions may have been replaced by other actions
+        (e.g. a user-chosen action in an interactive session), in which case
+        nothing about the Goal was tested.
+
         Args:
             observations: The observations from the environment.
+            state: The current state of the motor system.
 
         Returns:
             Either a `MotorPolicyResult` with undo actions, which should be immediately
             returned by the caller, or `None` which allows the caller to continue
             execution.
         """
+        jump_was_executed = _jump_was_executed(state, self._agent_id, self._jump_goal)
         if self._should_undo(observations):
             logger.debug("Returning to previous position")
+            if jump_was_executed:
+                self._jump_goal.info["jump_failed"] = True
             result = MotorPolicyResult(self._undo_actions)
             self._reset_jump_state()
             return result
@@ -577,6 +621,8 @@ class JumpToGoal(MotorPolicy):
             "Object visible, maintaining new pose for hypothesis-testing action"
         )
 
+        if jump_was_executed:
+            self._jump_goal.info["jump_failed"] = False
         self._reset_jump_state()
         return None
 
@@ -609,11 +655,12 @@ class JumpToGoal(MotorPolicy):
         self._is_jumping = False
         self._pre_jump_state = None
         self._undo_actions = []
+        self._jump_goal = None
 
     def _jump(self, state: MotorSystemState, goal: Goal) -> list[Action]:
         """Compute the jump and undo jump actions.
 
-        The undo jump actions are stored in `self._undo_jump_actions`.
+        The undo jump actions are stored in `self._undo_actions`.
 
         Args:
             state: The current state of the motor system.
@@ -630,6 +677,10 @@ class JumpToGoal(MotorPolicy):
         # If the hypothesis-guided jump is unsuccessful (e.g. to empty space
         # or inside an object), we return here.
         self._pre_jump_state = state[self._agent_id]
+
+        # Keep a reference to the Goal so its outcome can be recorded once we
+        # know whether the jump succeeded (see _maybe_undo).
+        self._jump_goal = goal
 
         # Check that all sensors have identical rotations - this is because actions
         # currently update them all together; if this changes, the code needs
@@ -714,6 +765,7 @@ class InformedPolicy(BasePolicy):
     _is_undoing_jump: bool
     _pre_jump_state: AgentState | None
     _undo_jump_actions: list[Action]
+    _jump_goal: Goal | None
 
     def __init__(
         self,
@@ -818,6 +870,14 @@ class InformedPolicy(BasePolicy):
     ) -> MotorPolicyResult | None:
         """Handle the outcome of a jump.
 
+        The outcome is recorded on the Goal that initiated the jump
+        (`goal.info["jump_failed"]`) so that the sender of the Goal (e.g. an
+        LM's GSG) can react to failed jumps. It is only recorded when the
+        jump was actually executed (the agent is at the Goal's location);
+        the proposed jump actions may have been replaced by other actions
+        (e.g. a user-chosen action in an interactive session), in which case
+        nothing about the Goal was tested.
+
         Args:
             observations: The observations from the environment.
             state: The current state of the motor system.
@@ -833,14 +893,20 @@ class InformedPolicy(BasePolicy):
             self._reset_jump_state()
             return None
 
+        jump_was_executed = _jump_was_executed(state, self.agent_id, self._jump_goal)
         if self._should_undo_jump(observations):
             logger.debug("Returning to previous position")
+            if jump_was_executed:
+                self._jump_goal.info["jump_failed"] = True
+            self._jump_goal = None
             self._is_undoing_jump = True
             return MotorPolicyResult(self._undo_jump_actions)
 
         logger.debug(
             "Object visible, maintaining new pose for hypothesis-testing action"
         )
+        if jump_was_executed:
+            self._jump_goal.info["jump_failed"] = False
         self._handle_successful_jump()
         self._reset_jump_state()
         return None
@@ -883,6 +949,7 @@ class InformedPolicy(BasePolicy):
         self._is_undoing_jump = False
         self._pre_jump_state = None
         self._undo_jump_actions = []
+        self._jump_goal = None
 
     def _jump(self, state: MotorSystemState, goal: Goal) -> list[Action]:
         """Compute the jump and undo jump actions.
@@ -904,6 +971,10 @@ class InformedPolicy(BasePolicy):
         # If the hypothesis-guided jump is unsuccessful (e.g. to empty space
         # or inside an object), we return here.
         self._pre_jump_state = state[self.agent_id]
+
+        # Keep a reference to the Goal so its outcome can be recorded once we
+        # know whether the jump succeeded (see _jump_outcome).
+        self._jump_goal = goal
 
         # Check that all sensors have identical rotations - this is because actions
         # currently update them all together; if this changes, the code needs

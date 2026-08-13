@@ -10,9 +10,12 @@
 from __future__ import annotations
 
 import copy
+from unittest.mock import Mock, patch
 
 import numpy as np
+import quaternion as qt
 
+from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.experiments.mode import ExperimentMode
 from tbp.monty.frameworks.models.evidence_matching.learning_module import (
     EvidenceGraphLM,
@@ -21,6 +24,13 @@ from tbp.monty.frameworks.models.goal_generation import (
     DenseExplorationGoalGenerator,
     EvidenceGoalGenerator,
 )
+from tbp.monty.frameworks.models.motor_policies import JumpToGoal
+from tbp.monty.frameworks.models.motor_system_state import (
+    AgentState,
+    MotorSystemState,
+    SensorState,
+)
+from tbp.monty.frameworks.sensors import SensorID
 from tests.unit.resources.unit_test_utils import BaseGraphTest
 
 
@@ -988,6 +998,46 @@ class EvidenceLMTest(BaseGraphTest):
             graph_lm.matching_step(self.ctx, [fake_obs_test[step % 4]])
         return graph_lm
 
+    def get_persistent_elm_after_dense_exploration_steps(self):
+        """Like get_elm_after_dense_exploration_steps, but reach persistence.
+
+        Failed-jump annotations (like the annotation of matched nodes) are
+        gated on the LM's persistent hypotheses being narrowed down to the
+        target graph, so tests of those annotations need an LM that has
+        reached this "high confidence" state. Runs matching steps until the
+        persistence condition is met and then clears the annotations that
+        accumulated along the way, so tests start from a clean, deterministic
+        annotation state.
+
+        Returns:
+            The learning module (with `graph_lm.gsg` set to the
+            DenseExplorationGoalGenerator) whose persistent hypotheses are
+            narrowed down to "new_object0".
+        """
+        gsg = DenseExplorationGoalGenerator(**self.default_gsg_config)
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn, gsg=gsg)
+        graph_lm.required_symmetry_evidence = 3
+        # Prevent a split while the persistence condition is being reached.
+        graph_lm.split_bimodality_threshold = np.inf
+
+        graph_lm.mode = ExperimentMode.EVAL
+        graph_lm.reset_stm()
+        graph_lm.fixme_reset_ground_truth(primary_target=self.placeholder_target)
+        fake_obs_test = copy.deepcopy(self.fake_obs_learn)
+        for step in range(12):
+            graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+            graph_lm.matching_step(self.ctx, [fake_obs_test[step % 4]])
+        self.assertListEqual(
+            list(graph_lm._persistent_hypothesis_ids.keys()),
+            ["new_object0"],
+            "Persistent hypotheses should be narrowed down to new_object0.",
+        )
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        model._match_evidence.clear()
+        gsg._goals_pending_jump_outcome = []
+        return graph_lm
+
     def test_dense_exploration_targets_nearest_unannotated_point(self):
         """The dense-exploration policy targets the sole unannotated point."""
         graph_lm = self.get_elm_after_dense_exploration_steps()
@@ -1003,7 +1053,7 @@ class EvidenceLMTest(BaseGraphTest):
         model.annotate_match_evidence(annotated, [1.0] * len(annotated))
 
         self.assertEqual(
-            gsg._nearest_unannotated_node(),
+            gsg._get_unannotated_node(),
             target_node,
             "The only unannotated node should be selected as the target.",
         )
@@ -1026,12 +1076,452 @@ class EvidenceLMTest(BaseGraphTest):
         model.annotate_match_evidence(list(range(n_nodes)), [1.0] * n_nodes)
 
         self.assertIsNone(
-            gsg._nearest_unannotated_node(),
+            gsg._get_unannotated_node(),
             "No target should be proposed when all points are annotated.",
         )
         self.assertIsNone(
             gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])]),
             "The None Goal should be generated when all points are annotated.",
+        )
+
+    def test_dense_exploration_annotates_failed_jump_target(self):
+        """A model point whose jump was undone receives negative evidence."""
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        self.assertIn(
+            goal,
+            gsg._goals_pending_jump_outcome,
+            "The emitted Goal should await its jump outcome.",
+        )
+        target_node = goal.info["target_loc_id"]
+        model = graph_lm.graph_memory.get_graph(
+            goal.info["target_graph_id"], goal.info["target_input_channel"]
+        )
+        _, counts_before = model.get_match_evidence(node_ids=[target_node])
+        self.assertEqual(
+            counts_before[0],
+            0,
+            "The targeted point should not be annotated yet.",
+        )
+
+        # Simulate the motor system undoing the jump to the Goal (i.e. the
+        # targeted point does not exist in the world).
+        goal.info["jump_failed"] = True
+        gsg._annotate_failed_jump_targets()
+
+        evidence, counts = model.get_match_evidence(node_ids=[target_node])
+        self.assertEqual(
+            counts[0],
+            1,
+            "The failed jump's target should now count as annotated.",
+        )
+        self.assertEqual(
+            evidence[0],
+            -1.0,
+            "The failed jump's target should have received -1 evidence.",
+        )
+        self.assertNotIn(
+            goal,
+            gsg._goals_pending_jump_outcome,
+            "The resolved Goal should no longer be pending.",
+        )
+
+    def test_dense_exploration_ignores_successful_jump_target(self):
+        """A model point whose jump succeeded receives no failure annotation."""
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        target_node = goal.info["target_loc_id"]
+        model = graph_lm.graph_memory.get_graph(
+            goal.info["target_graph_id"], goal.info["target_input_channel"]
+        )
+
+        goal.info["jump_failed"] = False
+        gsg._annotate_failed_jump_targets()
+
+        _, counts = model.get_match_evidence(node_ids=[target_node])
+        self.assertEqual(
+            counts[0],
+            0,
+            "A successful jump should not annotate the targeted point.",
+        )
+        self.assertNotIn(
+            goal,
+            gsg._goals_pending_jump_outcome,
+            "The resolved Goal should no longer be pending.",
+        )
+
+    def test_failed_jump_before_confidence_is_discarded(self):
+        """No -1 annotation while the LM has not reached high confidence.
+
+        The accumulation of match evidence (_annotate_matched_nodes) only
+        starts once the LM's persistent hypotheses are narrowed down to one
+        object. Failed-jump evidence must respect the same gating: a Goal
+        computed from a not-yet-confident hypothesis is not reliable evidence
+        against the targeted model points, so its failure is discarded
+        without annotating anything.
+        """
+        # Two matching steps: an MLH exists but persistence is not reached.
+        graph_lm = self.get_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+        self.assertEqual(
+            len(graph_lm._persistent_hypothesis_ids),
+            0,
+            "The LM should not have reached the persistence condition yet.",
+        )
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        model = graph_lm.graph_memory.get_graph(
+            goal.info["target_graph_id"], goal.info["target_input_channel"]
+        )
+
+        goal.info["jump_failed"] = True
+        gsg._annotate_failed_jump_targets()
+
+        _, counts = model.get_match_evidence()
+        self.assertTrue(
+            np.all(counts == 0),
+            "No point should be annotated before the LM is confident.",
+        )
+        self.assertNotIn(
+            goal,
+            gsg._goals_pending_jump_outcome,
+            "The discarded Goal should no longer be pending.",
+        )
+
+    def test_failed_jump_annotates_local_region(self):
+        """All points within the location tolerance of the target receive -1.
+
+        A failed jump is evidence against the local region of the model, not
+        just the single targeted node: had any point within the Goal's
+        location tolerance existed in the world, the jump would have found
+        the object.
+        """
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+        # Widen the tolerance so it covers the nodes at (1,1,1) and (1,1,0)
+        # (distance 1.0) but not (1,0,0) (distance ~1.41) or (0,0,0).
+        gsg.goal_tolerances["location"] = 1.2
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        model = graph_lm.graph_memory.get_graph(
+            goal.info["target_graph_id"], goal.info["target_input_channel"]
+        )
+        pos = np.asarray(model.pos)
+        target_node = int(
+            np.argmin(np.linalg.norm(pos - np.array([1.0, 1.0, 1.0]), axis=1))
+        )
+        neighbor_node = int(
+            np.argmin(np.linalg.norm(pos - np.array([1.0, 1.0, 0.0]), axis=1))
+        )
+        goal.info["target_loc_id"] = target_node
+
+        goal.info["jump_failed"] = True
+        gsg._annotate_failed_jump_targets()
+
+        evidence, counts = model.get_match_evidence()
+        for node in (target_node, neighbor_node):
+            self.assertEqual(
+                counts[node],
+                1,
+                "Points within the tolerance of the target should have been "
+                "annotated.",
+            )
+            self.assertEqual(
+                evidence[node],
+                -1.0,
+                "Points within the tolerance of the target should have "
+                "received -1 evidence.",
+            )
+        outside = [
+            i for i in range(pos.shape[0]) if i not in (target_node, neighbor_node)
+        ]
+        self.assertTrue(
+            np.all(counts[outside] == 0),
+            "Points outside the tolerance of the target should not have been "
+            "annotated.",
+        )
+
+    def test_dense_exploration_full_loop_annotates_failed_jump(self):
+        """The -1 annotation works end-to-end through a real motor policy.
+
+        A Goal emitted by the GSG is enacted by a real JumpToGoal policy: the
+        agent is teleported to the Goal's location, nothing is visible there
+        (a failed jump), the policy undoes the jump and records the outcome
+        on the Goal, and the next matching step folds -1 into the targeted
+        model point's annotation.
+        """
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        pos = np.asarray(model.pos)
+        # Leave only the node at (1,1,1) unannotated so the Goal
+        # deterministically targets it (and the final matching step, whose
+        # observation is at (0,0,0), cannot touch it with its own annotation
+        # of matched nodes).
+        target_node = int(
+            np.argmin(np.linalg.norm(pos - np.array([1.0, 1.0, 1.0]), axis=1))
+        )
+        annotated = [i for i in range(pos.shape[0]) if i != target_node]
+        model.annotate_match_evidence(annotated, [1.0] * len(annotated))
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        self.assertEqual(goal.info["target_loc_id"], target_node)
+
+        agent_id = AgentID("agent_id_0")
+
+        def state_at(position):
+            return MotorSystemState(
+                {
+                    agent_id: AgentState(
+                        sensors={
+                            SensorID("sensor_id_0"): SensorState(
+                                position=(0.0, 0.0, 0.0), rotation=qt.one
+                            )
+                        },
+                        position=position,
+                        rotation=qt.one,
+                    )
+                }
+            )
+
+        policy = JumpToGoal(agent_id, SensorID("view_finder"))
+        result = policy(
+            ctx=Mock(),
+            observations=Mock(),
+            state=state_at((0.0, 0.0, 0.0)),
+            percept=Mock(),
+            goal=goal,
+        )
+        self.assertGreater(
+            len(result.actions), 0, "The policy should enact the jump."
+        )
+        with patch(
+            "tbp.monty.frameworks.models.motor_policies."
+            "PositioningProcedure.depth_at_center",
+            return_value=1.0,  # Nothing visible at the target: a failed jump.
+        ):
+            result = policy(
+                ctx=Mock(),
+                observations=Mock(),
+                # The jump was executed: the agent is at the Goal's location.
+                state=state_at(tuple(goal.location)),
+                percept=Mock(),
+                goal=None,
+            )
+        self.assertGreater(
+            len(result.actions), 0, "The policy should undo the jump."
+        )
+        self.assertIs(
+            goal.info["jump_failed"],
+            True,
+            "The policy should record the failure on the Goal.",
+        )
+
+        # The next matching step (which steps the GSG) applies the annotation.
+        graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+        graph_lm.matching_step(self.ctx, [copy.deepcopy(self.fake_obs_learn[0])])
+
+        evidence, counts = model.get_match_evidence(node_ids=[target_node])
+        self.assertEqual(
+            counts[0],
+            1,
+            "The failed jump's target should have been annotated once.",
+        )
+        self.assertEqual(
+            evidence[0],
+            -1.0,
+            "The failed jump's target should have received -1 evidence.",
+        )
+
+    def test_failed_jump_folds_into_existing_annotation(self):
+        """The -1 is folded into a previously annotated point via the EMA."""
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        target_node = goal.info["target_loc_id"]
+        model = graph_lm.graph_memory.get_graph(
+            goal.info["target_graph_id"], goal.info["target_input_channel"]
+        )
+        # The point was previously annotated with positive evidence (e.g. by
+        # _annotate_matched_nodes) before the jump to it failed.
+        model.annotate_match_evidence([target_node], [1.0])
+
+        goal.info["jump_failed"] = True
+        gsg._annotate_failed_jump_targets()
+
+        evidence, counts = model.get_match_evidence(node_ids=[target_node])
+        expected = 1.0 + model.match_evidence_smoothing * (
+            gsg.failed_jump_evidence - 1.0
+        )
+        self.assertEqual(
+            counts[0],
+            2,
+            "The failure should count as a second annotation of the point.",
+        )
+        self.assertAlmostEqual(
+            evidence[0],
+            expected,
+            msg="The -1 should be folded into the existing annotation with "
+            "the model's EMA smoothing.",
+        )
+
+    def test_repeated_failed_jumps_drive_annotation_towards_minus_one(self):
+        """Repeated failures accumulate, pulling the stored evidence to -1."""
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        target_node = goal.info["target_loc_id"]
+        model = graph_lm.graph_memory.get_graph(
+            goal.info["target_graph_id"], goal.info["target_input_channel"]
+        )
+        # Start from a strongly positive annotation.
+        model.annotate_match_evidence([target_node], [1.0])
+
+        # Re-enact the (already emitted) Goal once per failure below.
+        gsg._goals_pending_jump_outcome = []
+
+        num_failures = 30
+        previous = 1.0
+        for _ in range(num_failures):
+            gsg._goals_pending_jump_outcome.append(goal)
+            goal.info["jump_failed"] = True
+            gsg._annotate_failed_jump_targets()
+            evidence, _ = model.get_match_evidence(node_ids=[target_node])
+            self.assertLess(
+                evidence[0],
+                previous,
+                "Each failure should decrease the stored evidence.",
+            )
+            previous = evidence[0]
+
+        evidence, counts = model.get_match_evidence(node_ids=[target_node])
+        self.assertEqual(
+            counts[0],
+            num_failures + 1,
+            "Each failure should count as an annotation of the point.",
+        )
+        self.assertLess(
+            evidence[0],
+            -0.9,
+            "Repeated failures should pull the evidence close to -1.",
+        )
+
+    def test_failed_jump_annotation_survives_newer_pending_goals(self):
+        """A failed jump is annotated even after newer Goals were emitted.
+
+        Reproduces the real timeline: the GSG steps once more (emitting a new
+        Goal) before the motor system records the outcome of the previous
+        jump. The older Goal must remain tracked until its outcome arrives.
+        """
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+        observations = [copy.deepcopy(self.fake_obs_learn[1])]
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        pos = np.asarray(model.pos)
+        # Leave a single unannotated node so successive Goals
+        # deterministically target the same point.
+        target_node = int(
+            np.argmin(np.linalg.norm(pos - np.array([1.0, 1.0, 1.0]), axis=1))
+        )
+        annotated = [i for i in range(pos.shape[0]) if i != target_node]
+        model.annotate_match_evidence(annotated, [1.0] * len(annotated))
+
+        first_goal = gsg._generate_goal(observations)
+        self.assertEqual(first_goal.info["target_loc_id"], target_node)
+        # The GSG steps again before the jump outcome is known: the pending
+        # Goal is retained and a newer Goal is emitted.
+        gsg._annotate_failed_jump_targets()
+        second_goal = gsg._generate_goal(observations)
+        self.assertEqual(second_goal.info["target_loc_id"], target_node)
+        self.assertIn(
+            first_goal,
+            gsg._goals_pending_jump_outcome,
+            "The unresolved Goal should still be tracked.",
+        )
+
+        # The motor system now records the failure of the first jump (the
+        # second Goal was superseded before being enacted).
+        first_goal.info["jump_failed"] = True
+        gsg._annotate_failed_jump_targets()
+
+        evidence, counts = model.get_match_evidence(node_ids=[target_node])
+        self.assertEqual(
+            counts[0],
+            1,
+            "The failed jump's target should have been annotated once.",
+        )
+        self.assertEqual(
+            evidence[0],
+            -1.0,
+            "The failed jump's target should have received -1 evidence.",
+        )
+        self.assertNotIn(
+            first_goal,
+            gsg._goals_pending_jump_outcome,
+            "The resolved Goal should no longer be pending.",
+        )
+
+    def test_failed_jump_target_is_not_retargeted(self):
+        """A point whose jump failed counts as visited and is not re-proposed."""
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+        observations = [copy.deepcopy(self.fake_obs_learn[1])]
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        n_nodes = np.asarray(model.pos).shape[0]
+        # Leave a single unannotated node so the Goal deterministically
+        # targets it.
+        annotated = list(range(1, n_nodes))
+        model.annotate_match_evidence(annotated, [1.0] * len(annotated))
+
+        goal = gsg._generate_goal(observations)
+        self.assertEqual(goal.info["target_loc_id"], 0)
+
+        goal.info["jump_failed"] = True
+        gsg._annotate_failed_jump_targets()
+
+        self.assertIsNone(
+            gsg._get_unannotated_node(),
+            "The failed jump's target should now count as visited.",
+        )
+        self.assertIsNone(
+            gsg._generate_goal(observations),
+            "No Goal should target the failed jump's point again.",
+        )
+
+    def test_failed_jump_to_removed_graph_is_ignored(self):
+        """A failure whose target graph no longer exists is safely skipped."""
+        graph_lm = self.get_persistent_elm_after_dense_exploration_steps()
+        gsg = graph_lm.gsg
+
+        goal = gsg._generate_goal([copy.deepcopy(self.fake_obs_learn[1])])
+        self.assertIsNotNone(goal, "A Goal should be generated.")
+        # Simulate the graph being removed (e.g. by a split) before the jump
+        # outcome arrived.
+        goal.info["target_graph_id"] = "removed_object"
+        goal.info["jump_failed"] = True
+
+        gsg._annotate_failed_jump_targets()  # Should not raise.
+
+        self.assertNotIn(
+            goal,
+            gsg._goals_pending_jump_outcome,
+            "The resolved Goal should no longer be pending.",
         )
 
     def test_dense_exploration_can_generate_goal_every_step(self):

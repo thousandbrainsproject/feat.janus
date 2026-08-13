@@ -20,7 +20,7 @@ experiment:
     max_eval_steps: 500
     max_total_steps: 6000
     n_train_epochs: 3
-    model_name_or_path: ${constants.janus_pretrained_dir}/two_can_two_banana/pretrained/
+    model_name_or_path: ${constants.janus_pretrained_dir}/banana_can_sparsity/pretrained/
     n_eval_epochs: ${constants.rotations_all_count}
     match_criterion:
       _target_: tbp.monty.experiment.match_criteria.AnyLMsMatch

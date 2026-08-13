@@ -1052,7 +1052,7 @@ class DenseExplorationGoalGenerator(EvidenceGoalGenerator):
             most-likely object model yet or all of its points have already
             been annotated.
         """
-        target_loc_id = self._nearest_unannotated_node()
+        target_loc_id = self._get_unannotated_node()
         if target_loc_id is None:
             return self._generate_none_goal()
 
@@ -1066,7 +1066,7 @@ class DenseExplorationGoalGenerator(EvidenceGoalGenerator):
             goal_confidence=goal_confidence,
         )
 
-    def _nearest_unannotated_node(self) -> int | None:
+    def _get_unannotated_node(self, condition="random") -> int | None:
         """Find the unannotated model point nearest to the current MLH location.
 
         Looks up the match-evidence annotations of the current most-likely
@@ -1094,7 +1094,19 @@ class DenseExplorationGoalGenerator(EvidenceGoalGenerator):
             return None
 
         unannotated_locs = np.asarray(model.pos)[unannotated]
+
         distances = np.linalg.norm(
             unannotated_locs - np.asarray(mlh["location"]), axis=1
         )
-        return int(unannotated[np.argmin(distances)])
+
+        if condition == "nearest":
+            return int(unannotated[np.argmin(distances)])
+
+        elif condition == "farthest":
+            return int(unannotated[np.argmax(distances)])
+
+        elif condition == "random":
+            return int(unannotated[np.random.choice(unannotated.size)])
+
+        else:
+            raise ValueError(f"Invalid condition: {condition}")

@@ -1051,6 +1051,6 @@ class EvidenceLMTest(BaseGraphTest):
         # Before matching starts there is no meaningful MLH, so no target.
         graph_lm.reset_stm()
         self.assertIsNone(
-            gsg._nearest_unannotated_node(),
+            gsg._get_unannotated_node(),
             "No target should be proposed before matching has started.",
         )

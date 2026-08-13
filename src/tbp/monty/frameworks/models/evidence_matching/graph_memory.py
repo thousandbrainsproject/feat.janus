@@ -41,6 +41,10 @@ class EvidenceGraphMemory(GraphMemory):
         self.max_graph_size = max_graph_size
         self.num_model_voxels_per_dim = num_model_voxels_per_dim
 
+        # Optional visualization hook. Teleop can install a synchronous callback here.
+        # Monty/Janus itself does not depend on Teleop.
+        self._merge_animation_callback = None
+
     # =============== Public Interface Functions ===============
 
     # ------------------- Main Algorithm -----------------------
@@ -48,6 +52,14 @@ class EvidenceGraphMemory(GraphMemory):
     # ------------------ Getters & Setters ---------------------
     def get_initial_hypotheses(self):
         return self.get_memory_ids()
+
+    def set_merge_animation_callback(self, callback) -> None:
+        """Set an optional callback invoked immediately before a successful merge commits.
+
+        The callback is visualization-only. Exceptions raised by it are caught by
+        `_merge_graphs` so visualization can never prevent a memory merge.
+        """
+        self._merge_animation_callback = callback
 
     def get_rotation_features_at_all_nodes(self, graph_id, input_channel):
         """Get rotation features from all N nodes. Shape=(N, 3, 3).
@@ -270,6 +282,10 @@ class EvidenceGraphMemory(GraphMemory):
         only removed once every channel has succeeded. Since a copy is mutated, a
         `GridTooSmallError` leaves memory unchanged.
 
+        If a merge-animation callback is installed, it receives the exact
+        reference-frame transform inputs immediately before a successful merge
+        is committed to memory.
+
         Args:
             first_graph_id: ID of the graph whose model/grid is extended.
             merge_data: Per-channel list of
@@ -278,25 +294,72 @@ class EvidenceGraphMemory(GraphMemory):
             new_graph_id: ID to register the merged model under.
             old_graph_ids: IDs of the source graphs to remove from memory.
             location_rel_model: Location of the reference point in the first
-                model's reference frame (the first object's MLH location).
+                model's reference frame.
 
         Returns:
             Whether the merge succeeded. On failure memory is left unchanged.
         """
-        logger.info(f"Merging graphs {old_graph_ids} into new graph {new_graph_id}.")
+        logger.info(
+            f"Merging graphs {old_graph_ids} into new graph {new_graph_id}."
+        )
+
+        source_graph_ids = [
+            graph_id
+            for graph_id in old_graph_ids
+            if graph_id != first_graph_id
+        ]
 
         merged_models = {}
+        animation_channels = {}
+
         for channel, entries in merge_data.items():
             first_model = self.models_in_memory[first_graph_id][channel]
+
+            animate_channel = len(entries) == len(source_graph_ids)
+
+            if not animate_channel:
+                logger.warning(
+                    "Cannot associate merge-animation entries with source graph IDs: "
+                    "%s entries for %s source graphs.",
+                    len(entries),
+                    len(source_graph_ids),
+                )
+
             try:
-                model = self._init_merged_model(first_model, first_graph_id, channel)
+                model = self._init_merged_model(
+                    first_model,
+                    first_graph_id,
+                    channel,
+                )
                 model.object_id = new_graph_id
-                for (
+
+                animation_entries = []
+
+                for entry_index, (
                     locations,
                     features,
                     object_rotation,
                     object_location_rel_body,
-                ) in entries:
+                ) in enumerate(entries):
+                    if animate_channel:
+                        animation_entries.append(
+                            {
+                                "source_graph_id": source_graph_ids[entry_index],
+                                "locations": np.asarray(
+                                    locations,
+                                    dtype=float,
+                                ).copy(),
+                                "features": copy.deepcopy(features),
+                                "object_rotation": copy.deepcopy(
+                                    object_rotation
+                                ),
+                                "object_location_rel_body": np.asarray(
+                                    object_location_rel_body,
+                                    dtype=float,
+                                ).copy(),
+                            }
+                        )
+
                     model.update_model(
                         locations=locations,
                         features=features,
@@ -304,16 +367,59 @@ class EvidenceGraphMemory(GraphMemory):
                         object_location_rel_body=object_location_rel_body,
                         object_rotation=object_rotation,
                     )
+
             except GridTooSmallError:
                 logger.info(
                     f"Merged points for {channel} do not fit in "
                     f"{first_graph_id}'s grid. Aborting merge, memory unchanged."
                 )
                 return False
+
             merged_models[channel] = model
 
+            if animate_channel:
+                animation_channels[channel] = {
+                    "target_points": np.asarray(
+                        first_model.pos,
+                        dtype=float,
+                    ).copy(),
+                    "entries": animation_entries,
+                    "merged_points": np.asarray(
+                        model.pos,
+                        dtype=float,
+                    ).copy(),
+                }
+
+        # At this point every temporary merged model was built successfully,
+        # but models_in_memory still contains the original unmerged objects.
+        if (
+            self._merge_animation_callback is not None
+            and animation_channels
+        ):
+            try:
+                self._merge_animation_callback(
+                    memory=self,
+                    first_graph_id=first_graph_id,
+                    new_graph_id=new_graph_id,
+                    old_graph_ids=tuple(old_graph_ids),
+                    location_rel_model=np.asarray(
+                        location_rel_model,
+                        dtype=float,
+                    ).copy(),
+                    channels=animation_channels,
+                )
+            except Exception:
+                logger.exception(
+                    "Merge-animation callback failed; "
+                    "continuing with graph merge."
+                )
+
         self.models_in_memory[new_graph_id] = merged_models
+
         for old_graph_id in old_graph_ids:
             self.remove_graph_from_memory(old_graph_id)
-            logger.info(f"Removed graph {old_graph_id} from memory.")
+            logger.info(
+                f"Removed graph {old_graph_id} from memory."
+            )
+
         return True

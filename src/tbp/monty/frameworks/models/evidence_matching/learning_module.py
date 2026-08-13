@@ -972,8 +972,8 @@ class EvidenceGraphLM(GraphLM):
         into an exponential moving average stored in the object model's
         metadata.
         """
-        # if len(self._persistent_hypothesis_ids) != 1:
-        #     return
+        if len(self._persistent_hypothesis_ids) != 1:
+            return
         graph_id, persistent_ids = next(iter(self._persistent_hypothesis_ids.items()))
         match_info = self._latest_match_info.get(graph_id)
         logger.info("Annotating match info!")
@@ -1005,19 +1005,19 @@ class EvidenceGraphLM(GraphLM):
     def _maybe_split_memory(self) -> None:
         """Split the recognized graph in two if its match evidence is bimodal.
 
-        Only considered once the persistent hypothesis set has been narrowed
-        down to a single graph and every point of that graph (across all input
-        channels) has been annotated with match evidence. If the distribution
-        of the annotated evidence values is approximately bimodal (see
-        _compute_bimodal_split_boundary), the graph is split into two component
-        graphs, one per evidence mode. The components share the source graph's
-        reference frame and their points need not be contiguous in space.
+        Only considered once matching has been narrowed down to a single object
+        ID (a single possible match) and every point of that graph (across all
+        input channels) has been annotated with match evidence. If the
+        distribution of the annotated evidence values is approximately bimodal
+        (see _compute_bimodal_split_boundary), the graph is split into two
+        component graphs, one per evidence mode. The components share the
+        source graph's reference frame and their points need not be contiguous
+        in space.
         """
-        if len(self._persistent_hypothesis_ids) != 1:
+        possible_matches = self.get_possible_matches()
+        if len(possible_matches) != 1:
             return
-        graph_id = next(iter(self._persistent_hypothesis_ids))
-        if graph_id not in self.graph_memory.get_memory_ids():
-            return
+        graph_id = possible_matches[0]
 
         evidence_per_channel = {}
         for channel in self.graph_memory.get_input_channels_in_graph(graph_id):

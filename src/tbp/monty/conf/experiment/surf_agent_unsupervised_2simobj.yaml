@@ -7,7 +7,7 @@ defaults:
   - /monty/sensor_module: camera_surf
   - /monty/connectivity: 1lm_1sm
   - /environment: mujoco_ycb_surf_agent
-  - /env_interface: train_simobj_random
+  - /env_interface: train_2simobj_random
   - /env_interface/transform: missing_depthto3d_sensor2_semantic0_clip
   - /logging: basic_info_monty_runs
 
@@ -18,7 +18,7 @@ experiment:
     max_train_steps: 6000
     max_eval_steps: 500
     max_total_steps: 6000
-    n_train_epochs: 10
+    n_train_epochs: 5
     n_eval_epochs: ${constants.rotations_all_count}
     model_name_or_path: ""
     match_criterion:

@@ -313,6 +313,47 @@ def get_cubic_patches(arr_shape, centers, size):
     return new_centers, mask
 
 
+def orthonormalize_pose_vectors(pose_vecs):
+    """Rebuild a right-handed orthonormal pose frame from degraded pose vectors.
+
+    Averaging pose vectors (across observations in a voxel or with a previously
+    stored mean) degrades their orthonormality and, when observations disagree
+    strongly (e.g. thin surfaces seen from both sides, or merged graphs), can
+    even flip the frame's handedness. Pose hypotheses are built directly from
+    these vectors and must be proper rotations, so we rebuild the closest
+    right-handed orthonormal frame: the surface normal is kept (normalized),
+    the first curvature direction is projected onto the tangent plane, and the
+    second curvature direction is recomputed as their cross product.
+
+    Args:
+        pose_vecs: Flat array of 9 values [surface_normal, cd1, cd2].
+
+    Returns:
+        Flat array of 9 values forming a right-handed orthonormal frame, or the
+        input unchanged if it is too degenerate to recover a frame from.
+    """
+    norm = np.asarray(pose_vecs[:3], dtype=float)
+    if np.linalg.norm(norm) < DEFAULT_TOLERANCE:
+        # Opposing surface normals can cancel out when averaged; the curvature
+        # directions still span the tangent plane, so recover the normal from
+        # them.
+        norm = np.cross(pose_vecs[3:6], pose_vecs[6:9])
+        if np.linalg.norm(norm) < DEFAULT_TOLERANCE:
+            logger.debug(f"Cannot orthonormalize degenerate pose vectors: {pose_vecs}")
+            return pose_vecs
+    norm = normalize(norm)
+    cd2 = np.cross(norm, pose_vecs[3:6])
+    if np.linalg.norm(cd2) < DEFAULT_TOLERANCE:
+        # cd1 is degenerate or parallel to the normal; use an arbitrary tangent
+        # direction. This only happens when the pose is not fully defined, in
+        # which case the curvature directions are ignored anyways.
+        fallback = [1.0, 0.0, 0.0] if abs(norm[0]) < 0.9 else [0.0, 1.0, 0.0]
+        cd2 = np.cross(norm, fallback)
+    cd2 = normalize(cd2)
+    cd1 = np.cross(cd2, norm)
+    return np.hstack([norm, cd1, cd2])
+
+
 def pose_vector_mean(pose_vecs, pose_fully_defined):
     """Calculate mean of pose vectors.
 
@@ -383,6 +424,10 @@ def pose_vector_mean(pose_vecs, pose_fully_defined):
             use_cds_to_update = True
             pv_means = np.hstack([norm_mean, cd1_mean, cd2_mean])
 
+    # The fallback branches above pair an averaged normal with raw curvature
+    # directions from a single observation, which can produce a non-orthonormal
+    # or even left-handed frame.
+    pv_means = orthonormalize_pose_vectors(pv_means)
     assert not np.any(np.isnan(pv_means)), "NaN in pose vector mean"
     return pv_means, use_cds_to_update
 

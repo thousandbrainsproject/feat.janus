@@ -33,6 +33,15 @@ experiment:
             goal_tolerances:
               location: 0.015
             desired_object_distance: 0.03
+          # Make burst sampling and hypothesis deletion harder to trigger
+          # (defaults: burst_trigger_slope=1.0, deletion_trigger_slope=0.5).
+          # Both are "fire when evidence slope falls below X" thresholds, so
+          # lowering them raises the bar for each event, keeping the
+          # hypotheses initialized at episode start alive for the whole
+          # episode unless their evidence is actively declining.
+          hypotheses_updater_args:
+            burst_trigger_slope: 0.5
+            deletion_trigger_slope: 0.0
     max_train_steps: 1000
     max_eval_steps: 500
     max_total_steps: 6000

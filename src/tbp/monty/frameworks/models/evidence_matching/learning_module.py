@@ -210,17 +210,25 @@ class EvidenceGraphLM(GraphLM):
             voxel. All locations that fall into the same voxel will be averaged and
             represented as one value. num_model_voxels_per_dim should not be too large
             since the memory requirements grow cubically with this number.
-        split_bimodality_threshold: Minimum Ashman's D between the two clusters
-            of a fully annotated model's match-evidence values for the
-            distribution to be considered bimodal and the model to be split
-            into two component graphs. Note the clusters are obtained by a hard
-            2-means partition, whose truncated within-cluster spreads inflate
-            the measured D relative to the textbook statistic (a unimodal
-            Gaussian measures ~2.6, a uniform distribution ~3.5), hence the
-            default of 4.0 rather than the classic 2.0.
+        split_cluster_separation_threshold: Minimum separation statistic
+            between a fully annotated model's positive-evidence values and its
+            remaining (non-positive) values for the positive values to count
+            as a clear cluster and the model to be split into two component
+            graphs. The statistic is (mean_pos - mean_rest) / std_pos, i.e.
+            how far the positive cluster sits from the rest of the
+            distribution relative to the cluster's own spread. Distributions
+            without a distinct positive cluster measure low (a unimodal
+            Gaussian centered at 0 measures ~2.7, a uniform distribution
+            ~3.5), hence the default of 4.0.
         split_min_cluster_fraction: Minimum fraction of a fully annotated
             model's points that each evidence cluster must contain for the
             model to be split.
+        split_spatial_neighbor_distance: Maximum distance (in meters) to
+            another candidate point of the same split component for a point to
+            be included in the component's new graph. Points without such a
+            neighbor are spatially isolated (they don't belong to a coherent
+            sub-object) and are dropped entirely when the component graphs
+            are built.
         gsg: The goal generator to associate with the LM.
         hypotheses_updater_class: The type of hypotheses updater to associate with the
             LM.
@@ -264,8 +272,9 @@ class EvidenceGraphLM(GraphLM):
         max_nodes_per_graph=2000,
         num_model_voxels_per_dim=50,  # -> voxel size = 6mm3 (0.006)
         use_multithreading=True,
-        split_bimodality_threshold=4.0,
+        split_cluster_separation_threshold=4.0,
         split_min_cluster_fraction=0.1,
+        split_spatial_neighbor_distance=0.005,
         gsg: EvidenceGoalGenerator | None = None,
         hypotheses_updater_class: type[HypothesesUpdater] = DefaultHypothesesUpdater,
         hypotheses_updater_args: dict | None = None,
@@ -304,8 +313,9 @@ class EvidenceGraphLM(GraphLM):
         self.pose_similarity_threshold = pose_similarity_threshold
         self.required_symmetry_evidence = required_symmetry_evidence
         # --- Model Splitting Params ---
-        self.split_bimodality_threshold = split_bimodality_threshold
+        self.split_cluster_separation_threshold = split_cluster_separation_threshold
         self.split_min_cluster_fraction = split_min_cluster_fraction
+        self.split_spatial_neighbor_distance = split_spatial_neighbor_distance
         # --- Model Params ---
         self.max_graph_size = max_graph_size
         # --- Debugging Params ---
@@ -1003,16 +1013,17 @@ class EvidenceGraphLM(GraphLM):
             )
 
     def _maybe_split_memory(self) -> None:
-        """Split the recognized graph in two if its match evidence is bimodal.
+        """Split the recognized graph if a positive-evidence cluster stands out.
 
         Only considered once matching has been narrowed down to a single object
         ID (a single possible match) and every point of that graph (across all
-        input channels) has been annotated with match evidence. If the
-        distribution of the annotated evidence values is approximately bimodal
-        (see _compute_bimodal_split_boundary), the graph is split into two
-        component graphs, one per evidence mode. The components share the
-        source graph's reference frame and their points need not be contiguous
-        in space.
+        input channels) has been annotated with match evidence. If the points
+        with positive match evidence form a clear cluster in evidence space
+        (see _detect_positive_evidence_cluster), the graph is split into two
+        component graphs: the positive-evidence cluster and all other points.
+        Within each component, points that are spatially isolated (no other
+        component point within split_spatial_neighbor_distance) are dropped
+        entirely. The components share the source graph's reference frame.
         """
         possible_matches = self.get_possible_matches()
         if len(possible_matches) != 1:
@@ -1026,26 +1037,51 @@ class EvidenceGraphLM(GraphLM):
             ).get_match_evidence()
             if len(evidence_means) == 0 or np.any(counts == 0):
                 # Not all model points have been annotated yet.
+                logger.debug(
+                    f"Not considering a split of {graph_id} ({channel}): "
+                    f"{np.count_nonzero(counts)}/{len(counts)} points "
+                    "annotated."
+                )
                 return
             evidence_per_channel[channel] = evidence_means
 
         pooled_evidence = np.concatenate(list(evidence_per_channel.values()))
-        boundary = self._compute_bimodal_split_boundary(pooled_evidence)
-        if boundary is None:
+        if not self._detect_positive_evidence_cluster(pooled_evidence):
+            logger.debug(
+                f"No positive-evidence cluster found in {graph_id} ({channel})."
+            )
             return
 
-        # Component 1 is the higher-evidence mode, component 2 the lower one.
+        # Component 1 is the positive-evidence cluster, component 2 all other
+        # points. Both are filtered for spatial coherence.
         node_ids_per_channel = {}
         for channel, evidence_means in evidence_per_channel.items():
-            high_ids = np.flatnonzero(evidence_means > boundary)
-            low_ids = np.flatnonzero(evidence_means <= boundary)
-            if high_ids.size == 0 or low_ids.size == 0:
+            locations = np.asarray(
+                self.graph_memory.get_locations_in_graph(graph_id, channel)
+            )
+            components = []
+            for candidate_ids in (
+                np.flatnonzero(evidence_means > 0),
+                np.flatnonzero(evidence_means <= 0),
+            ):
+                kept_ids = self._drop_spatially_isolated_points(
+                    candidate_ids, locations
+                )
+                if kept_ids.size < candidate_ids.size:
+                    logger.info(
+                        f"Dropping {candidate_ids.size - kept_ids.size} "
+                        f"spatially isolated candidate points of {graph_id} "
+                        f"({channel}) from the split."
+                    )
+                components.append(kept_ids)
+            if any(component.size == 0 for component in components):
                 logger.info(
-                    f"All of {graph_id}'s points in channel {channel} fall on "
-                    "one side of the evidence boundary; skipping split."
+                    f"One of {graph_id}'s split components in channel "
+                    f"{channel} has no spatially coherent points; skipping "
+                    "split."
                 )
                 return
-            node_ids_per_channel[channel] = [high_ids, low_ids]
+            node_ids_per_channel[channel] = components
 
         # Ensure the component ids do not collide with existing graphs so that
         # registration cannot silently overwrite an existing entry.
@@ -1066,67 +1102,85 @@ class EvidenceGraphLM(GraphLM):
             self._cleanup_after_split(graph_id, new_graph_ids)
             logger.info(
                 f"{self.learning_module_id} split {graph_id} into "
-                f"{new_graph_ids} (evidence boundary {np.round(boundary, 3)})."
+                f"{new_graph_ids} (positive-evidence cluster vs. rest)."
             )
 
-    def _compute_bimodal_split_boundary(self, evidence_values) -> float | None:
-        """Return the evidence boundary between two modes, if bimodal.
+    def _detect_positive_evidence_cluster(self, evidence_values) -> bool:
+        """Whether the positive-evidence values form a clear, separate cluster.
 
-        The values are clustered with 1-D 2-means (Lloyd's algorithm). The
-        distribution is considered approximately bimodal if the clusters are
-        well separated according to Ashman's D
-        (sqrt(2) * |mu1 - mu2| / sqrt(s1^2 + s2^2) > split_bimodality_threshold)
-        and each cluster contains at least split_min_cluster_fraction of the
-        values. Since the clusters come from a hard partition (rather than a
-        fitted mixture), their truncated spreads inflate D compared to the
-        textbook statistic; split_bimodality_threshold's default accounts for
-        this.
+        The annotated evidence values of sub-objects do not generally form a
+        bimodal distribution; instead, the points that consistently matched
+        (positive evidence) form a tight cluster while the remaining points
+        are spread out. We therefore partition the values at zero and measure
+        how far the positive cluster sits from the rest of the distribution
+        relative to the cluster's own spread:
+        (mean_pos - mean_rest) / std_pos.
+        A distribution without a distinct positive cluster measures low (a
+        unimodal Gaussian centered at 0 measures ~2.7, a uniform distribution
+        ~3.5); a tight positive cluster that is well separated from the other
+        values measures high. Additionally, each side of the partition must
+        contain at least split_min_cluster_fraction of the values.
 
         Args:
             evidence_values: The annotated evidence values of all model points.
 
         Returns:
-            The boundary separating the two modes, or None if the distribution
-            is not approximately bimodal.
+            Whether the positive-evidence values form a clear cluster that
+            warrants splitting the model.
         """
         values = np.asarray(evidence_values, dtype=float)
-        if len(values) < 4 or np.isclose(values.min(), values.max()):
-            return None
+        if len(values) < 4:
+            return False
 
-        # 1-D 2-means: seed the centers with the extremes and iterate.
-        center_low, center_high = float(values.min()), float(values.max())
-        boundary = (center_low + center_high) / 2
-        for _ in range(100):
-            lower = values[values <= boundary]
-            upper = values[values > boundary]
-            if len(lower) == 0 or len(upper) == 0:
-                return None
-            new_low, new_high = lower.mean(), upper.mean()
-            if np.isclose(new_low, center_low) and np.isclose(new_high, center_high):
-                break
-            center_low, center_high = new_low, new_high
-            boundary = (center_low + center_high) / 2
-
-        lower = values[values <= boundary]
-        upper = values[values > boundary]
+        positive = values[values > 0]
+        rest = values[values <= 0]
         min_cluster_size = self.split_min_cluster_fraction * len(values)
-        if len(lower) < min_cluster_size or len(upper) < min_cluster_size:
-            return None
+        if len(positive) < min_cluster_size or len(rest) < min_cluster_size:
+            return False
 
-        spread = np.sqrt(lower.std() ** 2 + upper.std() ** 2)
-        if spread == 0:
-            # Two distinct point masses: infinitely separated relative to
-            # their (zero) spread.
-            ashman_d = np.inf
+        cluster_spread = positive.std()
+        separation = positive.mean() - rest.mean()
+        if cluster_spread == 0:
+            # A point mass is infinitely tight relative to its (zero) spread.
+            separation_statistic = np.inf
         else:
-            ashman_d = np.sqrt(2) * np.abs(upper.mean() - lower.mean()) / spread
+            separation_statistic = separation / cluster_spread
         logger.debug(
-            f"Bimodality check: Ashman's D = {np.round(ashman_d, 3)} "
-            f"(threshold {self.split_bimodality_threshold})."
+            "Positive-evidence cluster check: separation statistic = "
+            f"{np.round(separation_statistic, 3)} "
+            f"(threshold {self.split_cluster_separation_threshold})."
         )
-        if ashman_d < self.split_bimodality_threshold:
-            return None
-        return float(boundary)
+        return separation_statistic >= self.split_cluster_separation_threshold
+
+    def _drop_spatially_isolated_points(
+        self,
+        candidate_ids: npt.NDArray[np.int_],
+        locations: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.int_]:
+        """Filter split-candidate points for spatial coherence.
+
+        A point only becomes part of a new component object if it lies within
+        split_spatial_neighbor_distance of at least one other candidate point
+        of the same component. Spatially isolated points (e.g. a single
+        stray positive-evidence point in the middle of the poorly matching
+        region) are dropped entirely when the component graphs are built.
+
+        Args:
+            candidate_ids: Node ids of the component's candidate points.
+            locations: Locations of all nodes in the graph, indexed by node id.
+
+        Returns:
+            The subset of candidate_ids with at least one nearby candidate.
+        """
+        if candidate_ids.size < 2:
+            # A single point has no neighbors, so it is isolated by definition.
+            return candidate_ids[:0]
+        candidate_locations = locations[candidate_ids]
+        candidate_tree = KDTree(candidate_locations)
+        # k=2 returns the nearest candidate other than the point itself.
+        distances, _ = candidate_tree.query(candidate_locations, k=2, p=2, workers=1)
+        has_close_neighbor = distances[:, 1] <= self.split_spatial_neighbor_distance
+        return candidate_ids[has_close_neighbor]
 
     def _cleanup_after_split(self, old_graph_id: str, new_graph_ids: list[str]) -> None:
         """Remove all stale references to the split-away graph.

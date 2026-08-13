@@ -769,61 +769,88 @@ class EvidenceLMTest(BaseGraphTest):
 
     # =================== Model splitting ===================
 
-    def test_bimodal_evidence_distribution_detected(self):
-        """A clearly bimodal distribution yields a boundary between the modes."""
+    def test_positive_evidence_cluster_detected(self):
+        """A tight positive cluster separate from the rest is detected."""
         graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
         rng = np.random.RandomState(42)
-        low_mode = rng.normal(-2.0, 0.1, 50)
-        high_mode = rng.normal(2.0, 0.1, 50)
+        # The well-matching points form a tight positive-evidence cluster;
+        # the remaining points are spread out over negative values (they do
+        # not form a mode of their own).
+        positive_cluster = rng.normal(2.0, 0.1, 50)
+        rest = rng.uniform(-2.0, 0.0, 50)
 
-        boundary = graph_lm._compute_bimodal_split_boundary(
-            np.concatenate([low_mode, high_mode])
-        )
-
-        self.assertIsNotNone(
-            boundary,
-            "A distribution with two well-separated modes should be "
-            "detected as bimodal.",
-        )
-        self.assertGreater(
-            boundary,
-            low_mode.max(),
-            "The split boundary should lie above the lower mode.",
-        )
-        self.assertLess(
-            boundary,
-            high_mode.min(),
-            "The split boundary should lie below the upper mode.",
+        self.assertTrue(
+            graph_lm._detect_positive_evidence_cluster(
+                np.concatenate([positive_cluster, rest])
+            ),
+            "A tight positive-evidence cluster that is well separated from "
+            "the remaining values should be detected.",
         )
 
-    def test_unimodal_evidence_distribution_not_split(self):
-        """Unimodal distributions should not be considered bimodal."""
+    def test_unclustered_evidence_distribution_not_split(self):
+        """Distributions without a distinct positive cluster are not split."""
         graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
         rng = np.random.RandomState(42)
 
-        self.assertIsNone(
-            graph_lm._compute_bimodal_split_boundary(rng.normal(0.0, 1.0, 200)),
-            "A Gaussian distribution should not be detected as bimodal.",
+        self.assertFalse(
+            graph_lm._detect_positive_evidence_cluster(rng.normal(0.0, 1.0, 200)),
+            "A Gaussian distribution centered at 0 should not be detected "
+            "as containing a positive-evidence cluster.",
         )
-        self.assertIsNone(
-            graph_lm._compute_bimodal_split_boundary(rng.uniform(-1.0, 1.0, 200)),
-            "A uniform distribution should not be detected as bimodal.",
+        self.assertFalse(
+            graph_lm._detect_positive_evidence_cluster(rng.uniform(-1.0, 1.0, 200)),
+            "A uniform distribution should not be detected as containing a "
+            "positive-evidence cluster.",
         )
-        self.assertIsNone(
-            graph_lm._compute_bimodal_split_boundary(np.ones(10)),
-            "Constant values should not be detected as bimodal.",
+        self.assertFalse(
+            graph_lm._detect_positive_evidence_cluster(np.ones(10)),
+            "All-positive values leave no second component to split off.",
+        )
+        self.assertFalse(
+            graph_lm._detect_positive_evidence_cluster(np.full(10, -1.0)),
+            "All-negative values contain no positive-evidence cluster.",
         )
 
     def test_tiny_cluster_does_not_trigger_split(self):
-        """A few outliers should not count as a second mode."""
+        """A few positive outliers should not count as a cluster."""
         graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
         rng = np.random.RandomState(42)
-        values = np.concatenate([rng.normal(0.0, 0.05, 97), np.full(3, 5.0)])
+        values = np.concatenate([rng.normal(-1.0, 0.05, 97), np.full(3, 5.0)])
 
-        self.assertIsNone(
-            graph_lm._compute_bimodal_split_boundary(values),
-            "A cluster holding less than split_min_cluster_fraction of the "
-            "values should not trigger a split.",
+        self.assertFalse(
+            graph_lm._detect_positive_evidence_cluster(values),
+            "A positive cluster holding less than split_min_cluster_fraction "
+            "of the values should not trigger a split.",
+        )
+
+    def test_spatially_isolated_points_dropped_from_split_component(self):
+        """Candidate points without a nearby candidate neighbor are dropped."""
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        graph_lm.split_spatial_neighbor_distance = 0.003
+        locations = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.002, 0.0, 0.0],
+                [0.004, 0.0, 0.0],
+                [0.1, 0.0, 0.0],  # isolated: nearest candidate is ~0.096 away
+            ]
+        )
+        candidate_ids = np.arange(4)
+
+        kept = graph_lm._drop_spatially_isolated_points(candidate_ids, locations)
+
+        self.assertListEqual(
+            list(kept),
+            [0, 1, 2],
+            "Only points within split_spatial_neighbor_distance of another "
+            "candidate should be kept.",
+        )
+        self.assertEqual(
+            graph_lm._drop_spatially_isolated_points(
+                np.array([3]), locations
+            ).size,
+            0,
+            "A single candidate point has no neighbors and should be dropped.",
         )
 
     def test_split_graph_partitions_model(self):
@@ -878,19 +905,23 @@ class EvidenceLMTest(BaseGraphTest):
                 "metadata.",
             )
 
-    def test_model_splits_after_full_bimodal_annotation(self):
-        """A fully annotated model with bimodal evidence is split in two.
+    def test_model_splits_after_full_annotation_with_positive_cluster(self):
+        """A fully annotated model with a positive-evidence cluster is split.
 
         Runs matching steps until the persistence ("high confidence")
-        condition is met, then overwrites the model's annotations with a
-        bimodal distribution covering all points. The next matching step
-        should detect this and split the model into two component graphs.
+        condition is met, then overwrites the model's annotations so that
+        part of the model forms a tight positive-evidence cluster and the
+        rest holds non-positive evidence. The next matching step should
+        detect this and split the model into two component graphs.
         """
         fake_obs_test = copy.deepcopy(self.fake_obs_learn)
         graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
         graph_lm.required_symmetry_evidence = 3
         # Prevent a split while the persistence condition is being reached.
-        graph_lm.split_bimodality_threshold = np.inf
+        graph_lm.split_cluster_separation_threshold = np.inf
+        # The fake object's points are 1m apart, so widen the spatial
+        # coherence radius to cover each component's nearest neighbors.
+        graph_lm.split_spatial_neighbor_distance = 1.5
 
         graph_lm.mode = ExperimentMode.EVAL
         graph_lm.reset_stm()
@@ -908,8 +939,8 @@ class EvidenceLMTest(BaseGraphTest):
 
         model = graph_lm.graph_memory.get_graph("new_object0", "patch")
         pos = np.asarray(model.pos).copy()
-        # The nodes at (0,0,0) and (1,0,0) form the high-evidence mode, the
-        # remaining nodes the low-evidence mode.
+        # The nodes at (0,0,0) and (1,0,0) form the positive-evidence
+        # cluster, the remaining nodes the poorly matching rest.
         high_ids = [
             int(np.argmin(np.linalg.norm(pos - location, axis=1)))
             for location in (np.zeros(3), np.array([1.0, 0.0, 0.0]))
@@ -921,7 +952,7 @@ class EvidenceLMTest(BaseGraphTest):
         # Freeze the annotations so the next step's annotation of matched
         # nodes does not move them.
         model.match_evidence_smoothing = 0.0
-        graph_lm.split_bimodality_threshold = 4.0
+        graph_lm.split_cluster_separation_threshold = 4.0
 
         graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
         graph_lm.matching_step(self.ctx, [fake_obs_test[0]])
@@ -975,6 +1006,55 @@ class EvidenceLMTest(BaseGraphTest):
             graph_lm._persistent_hypothesis_ids,
             {},
             "Persistent hypotheses should be reset by the split.",
+        )
+
+    def test_split_skipped_when_no_spatially_coherent_component(self):
+        """No split occurs when spatial filtering empties a component.
+
+        Same setup as the successful split test, but with the spatial
+        coherence radius left at a value smaller than the fake object's
+        1m point spacing: every candidate point is spatially isolated, so
+        both components come up empty and the model must stay intact.
+        """
+        fake_obs_test = copy.deepcopy(self.fake_obs_learn)
+        graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn)
+        graph_lm.required_symmetry_evidence = 3
+        # Prevent a split while the persistence condition is being reached.
+        graph_lm.split_cluster_separation_threshold = np.inf
+        # Smaller than the 1m spacing between the fake object's points, so
+        # no candidate point has a nearby candidate neighbor.
+        graph_lm.split_spatial_neighbor_distance = 0.5
+
+        graph_lm.mode = ExperimentMode.EVAL
+        graph_lm.reset_stm()
+        graph_lm.fixme_reset_ground_truth(primary_target=self.placeholder_target)
+
+        for step in range(12):
+            observation = fake_obs_test[step % 4]
+            graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+            graph_lm.matching_step(self.ctx, [observation])
+
+        model = graph_lm.graph_memory.get_graph("new_object0", "patch")
+        pos = np.asarray(model.pos)
+        high_ids = [
+            int(np.argmin(np.linalg.norm(pos - location, axis=1)))
+            for location in (np.zeros(3), np.array([1.0, 0.0, 0.0]))
+        ]
+        low_ids = [i for i in range(pos.shape[0]) if i not in high_ids]
+        model._match_evidence.clear()
+        model.annotate_match_evidence(high_ids, [3.0] * len(high_ids))
+        model.annotate_match_evidence(low_ids, [-3.0] * len(low_ids))
+        model.match_evidence_smoothing = 0.0
+        graph_lm.split_cluster_separation_threshold = 4.0
+
+        graph_lm.add_lm_processing_to_buffer_stats(lm_processed=True)
+        graph_lm.matching_step(self.ctx, [fake_obs_test[0]])
+
+        self.assertIn(
+            "new_object0",
+            graph_lm.get_all_known_object_ids(),
+            "The model should not be split when its candidate points are "
+            "spatially isolated.",
         )
 
     def test_stats_collection_after_split_does_not_raise(self):
@@ -1038,7 +1118,7 @@ class EvidenceLMTest(BaseGraphTest):
         graph_lm = self.get_elm_with_fake_object(self.fake_obs_learn, gsg=gsg)
         graph_lm.required_symmetry_evidence = 3
         # Prevent a split while the persistence condition is being reached.
-        graph_lm.split_bimodality_threshold = np.inf
+        graph_lm.split_cluster_separation_threshold = np.inf
 
         graph_lm.mode = ExperimentMode.EVAL
         graph_lm.reset_stm()

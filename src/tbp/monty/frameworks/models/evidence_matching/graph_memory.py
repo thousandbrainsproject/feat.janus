@@ -25,6 +25,10 @@ from tbp.monty.frameworks.utils.spatial_arithmetics import (
 
 logger = logging.getLogger(__name__)
 
+# Features that a merged model cannot be built without, since the grid fill
+# path uses them to average pose vectors per voxel.
+REQUIRED_MERGE_FEATURES = frozenset({"pose_vectors", "pose_fully_defined"})
+
 
 class EvidenceGraphMemory(GraphMemory):
     """Custom GraphMemory that stores GridObjectModel instead of GraphObjectModel."""
@@ -235,8 +239,9 @@ class EvidenceGraphMemory(GraphMemory):
         first graph's reference frame and combined with the first graph's own
         points. A fresh model is then built with the default grid parameters,
         anchored so the combined point cloud's bounding-box center sits at the
-        center of the grid. Source graphs are only removed once every channel
-        has succeeded, so a `GridTooSmallError` leaves memory unchanged.
+        center of the grid. Only features stored by every source object are kept
+        (see `REQUIRED_MERGE_FEATURES`). Source graphs are only removed once
+        every channel has succeeded, so a failure leaves memory unchanged.
 
         Args:
             first_graph_id: ID of the graph whose reference frame is used.
@@ -277,9 +282,30 @@ class EvidenceGraphMemory(GraphMemory):
                 locations.append(transformed_locations)
                 features.append(transformed_features)
             combined_locations = np.vstack(locations)
+            # Objects learned through different modalities store different
+            # features (e.g. a surface agent stores rgba, a distant agent does
+            # not). Only features present on every source object can be carried
+            # into the merged model; the rest are dropped rather than filled in,
+            # since fabricated values would be averaged into real ones.
+            common_names = set(features[0]).intersection(*map(set, features[1:]))
+            if not common_names.issuperset(REQUIRED_MERGE_FEATURES):
+                logger.info(
+                    f"Features shared by {old_graph_ids} for {channel} are missing "
+                    f"{sorted(REQUIRED_MERGE_FEATURES - common_names)}. "
+                    "Aborting merge, memory unchanged."
+                )
+                return False
+            dropped = set().union(*map(set, features)) - common_names
+            if dropped:
+                logger.info(
+                    f"Dropping features not shared by all of {old_graph_ids}: "
+                    f"{sorted(dropped)}."
+                )
+            # Keep the first graph's feature order for a deterministic mapping.
             combined_features = {
                 name: np.concatenate([f[name] for f in features])
                 for name in features[0]
+                if name in common_names
             }
             grid_center = (
                 combined_locations.min(axis=0) + combined_locations.max(axis=0)

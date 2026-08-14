@@ -31,6 +31,7 @@ from tbp.monty.frameworks.utils.object_model_utils import (
     get_most_common_value,
     get_values_from_dense_last_dim,
     increment_sparse_tensor_by_count,
+    orthonormalize_pose_vectors,
     pose_vector_mean,
     remove_close_points,
     torch_graph_to_numpy,
@@ -953,6 +954,8 @@ class GridObjectModel(GraphObjectModel):
                         previous_average = avg_feat
                 # NOTE: could weight these
                 avg_feat = (avg_feat + previous_average) / 2
+                if feature == "pose_vectors":
+                    avg_feat = orthonormalize_pose_vectors(avg_feat)
             target_ids = target_fm[feature]
             new_feature_avg[target_ids[0] : target_ids[1]] = avg_feat
         return new_feature_avg

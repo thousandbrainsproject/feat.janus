@@ -1,0 +1,49 @@
+# @package _global_
+
+defaults:
+  - /monty: evidencegraph_exp1000_emin_t3_tot2500
+  - /monty/motor_system_config: distant_5
+  - /monty/learning_module: janus_evidence_1lm_nn5_dod003
+  - /monty/sensor_module: camera_dist_delta_salience
+  - /monty/connectivity: 1lm_1sm
+  - /environment: mujoco_ycb_dist_agent
+  - /env_interface: janus_eval_simple_merge
+  - /env_interface/positioning_procedures_eval: getgoodview_viewfinder_patch
+  - /env_interface/transform: missing_depthto3d_sensor2_semantic0
+  - /logging: detailed_info_evidence_eval_runs
+
+experiment:
+  _target_: tbp.monty.frameworks.experiments.object_recognition_experiments.MontyObjectRecognitionExperiment
+  config:
+    show_sensor_output: false
+    monty_config:
+      monty_args:
+        # Keep the episode running well past the point where the LM reaches
+        # high confidence (persistent hypotheses, checked every matching step),
+        # so matching steps after confidence annotate the object model with
+        # match-evidence metadata before the episode can terminate.
+        min_eval_steps: 300
+      learning_modules:
+        learning_module_0:
+          # Use the dense-exploration policy instead of the default
+          # hypothesis-testing policy so that all model points are visited
+          # (and thereby annotated), enabling the model-splitting check.
+          gsg:
+            _target_: tbp.monty.frameworks.models.goal_generation.DenseExplorationGoalGenerator
+            goal_tolerances:
+              location: 0.015
+            desired_object_distance: 0.03
+    max_train_steps: 1000
+    max_eval_steps: 500
+    max_total_steps: 6000
+    n_train_epochs: 3
+    model_name_or_path: ${constants.janus_pretrained_dir}/mismerged_banana_can/pretrained/
+    n_eval_epochs: ${constants.rotations_3_count}
+    match_criterion:
+      _target_: tbp.monty.experiment.match_criteria.AnyLMsMatch
+      count: 1
+    seed: 42
+    supervised_lm_ids: []
+    python_log_level: DEBUG
+    logging:
+      run_name: base_config_10distinctobj_dist_agent_mujoco

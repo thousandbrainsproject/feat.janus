@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from tbp.monty.frameworks.models.graph_matching import GraphLM
 
 __all__ = [
+    "DenseExplorationGoalGenerator",
     "EvidenceGoalGenerator",
     "GraphGoalGenerator",
     "ParentLMNotProvided",
@@ -490,7 +491,7 @@ class EvidenceGoalGenerator(GraphGoalGenerator):
         min_post_goal_success_steps=np.inf,
         x_percent_scale_factor=0.75,
         desired_object_distance=0.03,
-        wait_growth_multiplier=2,
+        wait_growth_multiplier=1,
         **kwargs,
     ) -> None:
         """Initialize the Evidence GSG.
@@ -727,7 +728,9 @@ class EvidenceGoalGenerator(GraphGoalGenerator):
 
         Returns:
             A dictionary containing the hypothesis to test, the target location and
-            surface normal of the target point on the object.
+            surface normal of the target point on the object, as well as the
+            identity of the target point in the model (graph id, input channel
+            and node id).
         """
         mlh = self.parent_lm.get_current_mlh()
         mlh_id = mlh["graph_id"]
@@ -745,6 +748,9 @@ class EvidenceGoalGenerator(GraphGoalGenerator):
             "hypothesis_to_test": mlh,
             "target_loc": target_loc,
             "target_surface_normal": target_surface_normal,
+            "target_graph_id": mlh_id,
+            "target_input_channel": sensor_channel_name,
+            "target_loc_id": int(target_loc_id),
         }
 
     def _compute_goal_for_target_loc(
@@ -815,11 +821,18 @@ class EvidenceGoalGenerator(GraphGoalGenerator):
         # Extra metadata for logging. 'achieved' and
         # 'matching_step_when_output_goal_set' should be updated at the next step.
         # We initialize them as `None` to indicate that no valid values have been set.
+        # The 'target_*' keys identify the model point this Goal targets;
+        # 'jump_failed' is set (True/False) by the motor policy once the
+        # outcome of the jump to the Goal is known.
         info = {
             "proposed_surface_loc": proposed_surface_loc,
             "hypothesis_to_test": target_info["hypothesis_to_test"],
             "achieved": None,
             "matching_step_when_output_goal_set": None,
+            "target_graph_id": target_info["target_graph_id"],
+            "target_input_channel": target_info["target_input_channel"],
+            "target_loc_id": target_info["target_loc_id"],
+            "jump_failed": None,
         }
 
         return Goal(
@@ -1009,3 +1022,197 @@ class EvidenceGoalGenerator(GraphGoalGenerator):
             an output Goal was generated.
         """
         return self.parent_lm.buffer.get_num_steps_post_output_goal_generated()
+
+
+class DenseExplorationGoalGenerator(EvidenceGoalGenerator):
+    """GSG implementing a dense-exploration model-based policy.
+
+    Instead of the hypothesis-testing policy, this policy targets points in the
+    model of the current most-likely object that have not yet been annotated
+    with match evidence, ensuring all model points are efficiently visited (and
+    thereby annotated). Among the unannotated points, the one nearest to the
+    current most-likely-hypothesis location is chosen, minimizing travel and
+    sweeping out contiguous unexplored regions.
+
+    Unlike the hypothesis-testing policy, this policy can output a Goal on
+    every step rather than waiting for particular conditions to be met.
+
+    When a Goal targets a model point that turns out not to exist in the world
+    (the motor system jumps there, finds no object, and undoes the jump), the
+    targeted point is annotated with negative match evidence so that it counts
+    as visited and is marked as poorly matching.
+    """
+
+    # Match evidence folded into a model point whose jump was undone.
+    failed_jump_evidence = -1.0
+
+    # ======================= Public ==========================
+
+    # ------------------- Main Algorithm -----------------------
+
+    def reset(self):
+        """Reset additional state specific to the dense-exploration GSG."""
+        super().reset()
+        # Output Goals whose jump outcome (recorded on the Goal's info by the
+        # motor policy) has not been processed yet.
+        self._goals_pending_jump_outcome = []
+
+    def step(self, ctx: RuntimeContext, observations):
+        """Step the GSG, first folding in the outcomes of previous jumps."""
+        self._annotate_failed_jump_targets()
+        super().step(ctx, observations)
+
+    # ======================= Private ==========================
+
+    # ------------------- Main Algorithm -----------------------
+
+    def _annotate_failed_jump_targets(self) -> None:
+        """Apply negative evidence to model points whose jump was undone.
+
+        When the motor system fails to enact one of this GSG's output Goals
+        (it jumps to the target location, finds no object there, and undoes
+        the jump), the targeted region of the model likely does not exist in
+        the world. All model points within the location goal-tolerance of the
+        target point are annotated with failed_jump_evidence (-1) so they
+        count as visited (and are not targeted again) and are marked as
+        matching poorly. The whole neighborhood is annotated rather than the
+        single targeted node because the failure is evidence against the
+        local region: had a nearby point existed, the jump would have found
+        the object.
+
+        This mirrors the confidence gating of the accumulation process
+        (_annotate_matched_nodes): failures are only folded into the model
+        while the LM's persistent hypotheses are narrowed down to the target
+        graph. A failure observed before that is discarded, since the Goal
+        was computed from a hypothesis that may still be wrong about the
+        object's identity or pose.
+        """
+        still_pending = []
+        for goal in self._goals_pending_jump_outcome:
+            jump_failed = goal.info.get("jump_failed")
+            if jump_failed is None:
+                # Outcome not known yet.
+                still_pending.append(goal)
+                continue
+            if not jump_failed:
+                continue
+            graph_id = goal.info["target_graph_id"]
+            if graph_id not in self.parent_lm.get_all_known_object_ids():
+                # The graph was removed in the meantime (e.g. by a split), so
+                # the node id no longer identifies the targeted point.
+                continue
+            persistent_ids = self.parent_lm._persistent_hypothesis_ids
+            if len(persistent_ids) != 1 or graph_id not in persistent_ids:
+                # The LM is not (or no longer) confident that it is observing
+                # this graph, so the failure is not reliable evidence against
+                # the targeted model points.
+                continue
+            channel = goal.info["target_input_channel"]
+            model = self.parent_lm.get_graph(graph_id, input_channel=channel)
+            positions = np.asarray(model.pos)
+            target_loc = positions[goal.info["target_loc_id"]]
+            node_ids = np.flatnonzero(
+                np.linalg.norm(positions - target_loc, axis=1)
+                <= self.goal_tolerances.get("location", 0.0)
+            )
+            self.parent_lm.graph_memory.annotate_match_evidence(
+                graph_id=graph_id,
+                input_channel=channel,
+                node_ids=node_ids,
+                evidence_values=np.full(node_ids.size, self.failed_jump_evidence),
+            )
+            logger.debug(
+                f"Jump to node {goal.info['target_loc_id']} of {graph_id} "
+                f"({channel}) was undone; annotated {node_ids.size} points "
+                f"around it with {self.failed_jump_evidence} match evidence."
+            )
+        # A Goal's outcome is recorded one motor step after it is emitted, so
+        # any older unresolved Goal was superseded before being enacted and
+        # will never receive an outcome; keep only the most recent ones.
+        self._goals_pending_jump_outcome = still_pending[-2:]
+
+    def _check_need_new_output_goal(
+        self,
+        ctx: RuntimeContext,  # noqa: ARG002
+        output_goal_achieved,  # noqa: ARG002
+    ) -> bool:
+        """Determine whether the GSG should generate a new output Goal.
+
+        Returns:
+            Always True; the dense-exploration policy may emit a Goal on every
+            step (whether a meaningful Goal is available is determined in
+            _generate_goal).
+        """
+        return True
+
+    def _generate_goal(self, observations) -> Goal | None:
+        """Generate a Goal targeting the nearest unannotated model point.
+
+        Returns:
+            A Goal for the motor system, or the None Goal if there is no
+            most-likely object model yet or all of its points have already
+            been annotated.
+        """
+        target_loc_id = self._get_unannotated_node()
+        if target_loc_id is None:
+            return self._generate_none_goal()
+
+        target_info = self._get_target_loc_info(target_loc_id)
+
+        goal_confidence = self.parent_lm.get_output().confidence
+
+        goal = self._compute_goal_for_target_loc(
+            observations,
+            target_info,
+            goal_confidence=goal_confidence,
+        )
+        # Track the Goal so that if the motor system fails to enact it (and
+        # undoes the jump), the targeted model point receives negative
+        # evidence (see _annotate_failed_jump_targets).
+        self._goals_pending_jump_outcome.append(goal)
+        return goal
+
+    def _get_unannotated_node(self, condition="random") -> int | None:
+        """Find the unannotated model point nearest to the current MLH location.
+
+        Looks up the match-evidence annotations of the current most-likely
+        object's model (first sensory input channel) and selects, among the
+        points that have never been annotated, the one closest to the current
+        most-likely-hypothesis location (both expressed in the model's
+        reference frame).
+
+        Returns:
+            The index of the target node in the MLH object's graph, or None if
+            there is no most-likely object model yet or all of its points have
+            been annotated.
+        """
+        mlh = self.parent_lm.get_current_mlh()
+        graph_id = mlh["graph_id"]
+        if graph_id not in self.parent_lm.get_all_known_object_ids():
+            # No meaningful MLH yet (e.g. at the start of an episode).
+            return None
+
+        sensor_channel_name = self.parent_lm.buffer.get_first_sensory_input_channel()
+        model = self.parent_lm.get_graph(graph_id)[sensor_channel_name]
+        _, counts = model.get_match_evidence()
+        unannotated = np.flatnonzero(counts == 0)
+        if unannotated.size == 0:
+            return None
+
+        unannotated_locs = np.asarray(model.pos)[unannotated]
+
+        distances = np.linalg.norm(
+            unannotated_locs - np.asarray(mlh["location"]), axis=1
+        )
+
+        if condition == "nearest":
+            return int(unannotated[np.argmin(distances)])
+
+        elif condition == "farthest":
+            return int(unannotated[np.argmax(distances)])
+
+        elif condition == "random":
+            return int(unannotated[np.random.choice(unannotated.size)])
+
+        else:
+            raise ValueError(f"Invalid condition: {condition}")

@@ -4,7 +4,7 @@ do_eval: true
 eval_env_interface_args:
   parent_to_child_mapping: null
   object_names:
-    - fork
+    - spoon
   object_init_sampler:
     _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
     rotations: ${constants.rotations_all}

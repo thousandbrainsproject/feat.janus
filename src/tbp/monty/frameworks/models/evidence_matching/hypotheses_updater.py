@@ -276,7 +276,12 @@ class DefaultHypothesesUpdater(HypothesesUpdater):
                 displaced_hypotheses, features, new_channels, graph_id
             )
 
-        telemetry = {"mlh_prediction_error": displacer_telemetry.mlh_prediction_error}
+        telemetry = {
+            "mlh_prediction_error": displacer_telemetry.mlh_prediction_error,
+            # Which model nodes the tested hypotheses matched against this step.
+            # Consumed (and removed) by the LM for model annotation; not logged.
+            "channel_match_info": displacer_telemetry.channel_match_info,
+        }
         return displaced_hypotheses, telemetry
 
     def _initialize_new_channels(

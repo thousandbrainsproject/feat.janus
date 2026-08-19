@@ -76,7 +76,7 @@ class DefaultHypothesesDisplacerTest(TestCase):
             "pose_fully_defined": np.ones((1, 1, 1)),
         }
 
-        evidence = self.displacer._calculate_evidence_for_new_locations(
+        evidence, match_info = self.displacer._calculate_evidence_for_new_locations(
             graph_id="test_object",
             input_channel="channel_a",
             search_locations=np.zeros((1, 3)),
@@ -85,6 +85,7 @@ class DefaultHypothesesDisplacerTest(TestCase):
                 "pose_vectors": np.eye(3),
                 "pose_fully_defined": True,
             },
+            tested_hyp_ids=np.array([0]),
         )
 
         self.assertEqual(
@@ -96,6 +97,16 @@ class DefaultHypothesesDisplacerTest(TestCase):
             evidence.shape,
             (1,),
             "a single search location should produce exactly one evidence value",
+        )
+        self.assertEqual(
+            match_info.nearest_node_ids.shape,
+            (1, 1),
+            "match info should contain one nearest node per tested hypothesis",
+        )
+        self.assertEqual(
+            match_info.per_neighbor_evidence.shape,
+            (1, 1),
+            "match info should contain one evidence value per matched node",
         )
 
     def test_multi_channel_evidence_sums(self) -> None:
@@ -121,7 +132,10 @@ class DefaultHypothesesDisplacerTest(TestCase):
         with patch.object(
             self.displacer,
             "_calculate_evidence_for_new_locations",
-            side_effect=lambda **kw: evidence_by_channel[kw["input_channel"]],
+            side_effect=lambda **kw: (
+                evidence_by_channel[kw["input_channel"]],
+                Mock(),
+            ),
         ):
             result, _telemetry = (
                 self.displacer.displace_hypotheses_and_compute_evidence(
@@ -158,7 +172,10 @@ class DefaultHypothesesDisplacerTest(TestCase):
         with patch.object(
             self.displacer,
             "_calculate_evidence_for_new_locations",
-            side_effect=lambda **kw: evidence_by_channel[kw["input_channel"]],
+            side_effect=lambda **kw: (
+                evidence_by_channel[kw["input_channel"]],
+                Mock(),
+            ),
         ):
             _, telemetry = self.displacer.displace_hypotheses_and_compute_evidence(
                 displacement=np.zeros(3),
@@ -175,3 +192,60 @@ class DefaultHypothesesDisplacerTest(TestCase):
         # With 2 channels (C=2), range is [-C, 2C] = [-2, 4], mapped to [0, 1]:
         # prediction_error = (-2.0 + 2*2) / (3*2) = 1/3
         self.assertAlmostEqual(telemetry.mlh_prediction_error, 1 / 3)
+
+    def test_telemetry_contains_per_channel_match_info(self) -> None:
+        """Test that telemetry exposes which model nodes each hypothesis matched."""
+        num_hyps = 2
+        hypotheses = Hypotheses(
+            evidence=np.array([1.0, 2.0]),
+            locations=np.zeros((num_hyps, 3)),
+            poses=np.tile(np.eye(3), (num_hyps, 1, 1)),
+            possible=np.ones(num_hyps, dtype=bool),
+        )
+
+        channel_locations = np.zeros((1, 3))
+        location_tree = KDTree(channel_locations)
+        graph = Mock()
+        graph.find_nearest_neighbors = Mock(
+            side_effect=lambda search_locations, num_neighbors: location_tree.query(
+                search_locations,
+                k=num_neighbors,
+            )[1]
+        )
+        self.mock_graph_memory.get_input_channels_in_graph = Mock(
+            return_value=["channel_a"]
+        )
+        self.mock_graph_memory.get_graph.return_value = graph
+        self.mock_graph_memory.get_locations_in_graph.return_value = channel_locations
+        self.mock_graph_memory.get_feature_array.return_value = {
+            "channel_a": np.empty((1, 0))
+        }
+        self.mock_graph_memory.get_features_at_node.return_value = {
+            "pose_vectors": np.tile(np.eye(3).reshape(1, 1, 9), (num_hyps, 1, 1)),
+            "pose_fully_defined": np.ones((num_hyps, 1, 1)),
+        }
+
+        _, telemetry = self.displacer.displace_hypotheses_and_compute_evidence(
+            displacement=np.zeros(3),
+            features={
+                "channel_a": {
+                    "pose_vectors": np.eye(3),
+                    "pose_fully_defined": True,
+                },
+            },
+            evidence_update_threshold=-np.inf,
+            graph_id="test_object",
+            possible_hypotheses=hypotheses,
+        )
+
+        self.assertIn("channel_a", telemetry.channel_match_info)
+        match_info = telemetry.channel_match_info["channel_a"]
+        np.testing.assert_array_equal(match_info.tested_hyp_ids, [0, 1])
+        self.assertEqual(match_info.nearest_node_ids.shape, (num_hyps, 1))
+        self.assertEqual(match_info.per_neighbor_evidence.shape, (num_hyps, 1))
+        self.assertEqual(match_info.in_radius.shape, (num_hyps, 1))
+        self.assertTrue(
+            np.all(match_info.in_radius),
+            "all matched nodes are at the search locations so they should be in "
+            "the match radius",
+        )

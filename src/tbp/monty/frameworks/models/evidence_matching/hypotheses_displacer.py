@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -43,8 +43,33 @@ EVIDENCE_RANGE = MAX_EVIDENCE - MIN_EVIDENCE
 
 
 @dataclass
+class ChannelMatchInfo:
+    """Which model nodes each tested hypothesis matched against, and how well.
+
+    All arrays share the leading dimension T (number of tested hypotheses).
+    `tested_hyp_ids` maps rows back to indices in the hypothesis space passed to
+    the displacer. Since retained (displaced) hypotheses occupy the head of the
+    hypothesis array produced by the updaters, these ids remain valid indices
+    into the final per-step Hypotheses.
+    """
+
+    # Indices of the tested hypotheses in the hypothesis space. Shape (T,).
+    tested_hyp_ids: npt.NDArray[np.int_]
+    # Graph node ids of the K nearest neighbors per tested hypothesis. Shape (T, K).
+    nearest_node_ids: npt.NDArray[np.int_]
+    # Combined pose + feature evidence per neighbor. Shape (T, K).
+    per_neighbor_evidence: npt.NDArray[np.float64]
+    # Whether each neighbor was within max_match_distance. Shape (T, K).
+    in_radius: npt.NDArray[np.bool_]
+
+
+@dataclass
 class HypothesisDisplacerTelemetry:
     mlh_prediction_error: float | None
+    # Per input channel info about which model nodes were matched by the tested
+    # hypotheses at this step. Used to annotate object models with match
+    # evidence once an LM is confident.
+    channel_match_info: dict[str, ChannelMatchInfo] = field(default_factory=dict)
 
 
 class HypothesesDisplacer(Protocol):
@@ -150,14 +175,17 @@ class DefaultHypothesesDisplacer:
                 features, self.graph_memory.get_input_channels_in_graph(graph_id)
             )
             total_evidence_to_add = np.zeros_like(possible_hypotheses.evidence)
+            channel_match_info = {}
             for channel in input_channels:
-                new_evidence = self._calculate_evidence_for_new_locations(
+                new_evidence, match_info = self._calculate_evidence_for_new_locations(
                     graph_id=graph_id,
                     input_channel=channel,
                     search_locations=search_locations[hyp_idxs_to_test],
                     channel_possible_poses=possible_hypotheses.poses[hyp_idxs_to_test],
                     channel_features=features[channel],
+                    tested_hyp_ids=hyp_idxs_to_test,
                 )
+                channel_match_info[channel] = match_info
                 min_update = np.clip(np.min(new_evidence), 0, np.inf)
 
                 channel_evidence = (
@@ -193,13 +221,17 @@ class DefaultHypothesesDisplacer:
             evidence = possible_hypotheses.evidence
             # If we haven't moved yet, there is no prediction, and thus no error
             mlh_prediction_error = None
+            channel_match_info = {}
 
         return Hypotheses(
             evidence=evidence,
             locations=search_locations,
             poses=possible_hypotheses.poses,
             possible=possible_hypotheses.possible,
-        ), HypothesisDisplacerTelemetry(mlh_prediction_error=mlh_prediction_error)
+        ), HypothesisDisplacerTelemetry(
+            mlh_prediction_error=mlh_prediction_error,
+            channel_match_info=channel_match_info,
+        )
 
     def _calculate_evidence_for_new_locations(
         self,
@@ -208,6 +240,7 @@ class DefaultHypothesesDisplacer:
         search_locations: np.ndarray,
         channel_possible_poses: np.ndarray,
         channel_features: dict,
+        tested_hyp_ids: np.ndarray,
     ):
         """Use search locations, sensed features and graph model to calculate evidence.
 
@@ -221,8 +254,18 @@ class DefaultHypothesesDisplacer:
         We do this for every incoming input channel and its features if they are stored
         in the graph and take the average over the evidence from all input channels.
 
+        Args:
+            graph_id: The ID of the graph being matched against.
+            input_channel: The input channel to calculate evidence for.
+            search_locations: Displaced hypothesis locations to search at.
+            channel_possible_poses: Poses of the tested hypotheses.
+            channel_features: Sensed features for this channel.
+            tested_hyp_ids: Indices of the tested hypotheses in the hypothesis
+                space (used to build the returned ChannelMatchInfo).
+
         Returns:
-            The location evidence.
+            Tuple of the location evidence (shape (T,)) and a ChannelMatchInfo
+            describing which model nodes each tested hypothesis matched against.
         """
         logger.debug(
             f"Calculating evidence for {graph_id} using input from {input_channel}"
@@ -298,6 +341,13 @@ class DefaultHypothesesDisplacer:
         # perfectly and the node is at the search location.
         radius_evidence = radius_evidence + hypothesis_radius_feature_evidence
 
+        match_info = ChannelMatchInfo(
+            tested_hyp_ids=tested_hyp_ids,
+            nearest_node_ids=nearest_node_ids,
+            per_neighbor_evidence=radius_evidence,
+            in_radius=~mask,
+        )
+
         # We take the maximum to be better able to deal with parts of the model where
         # features change quickly and we may have noisy location information. This way
         # we check if we can find a good match of pose features within the search
@@ -309,7 +359,7 @@ class DefaultHypothesesDisplacer:
         return np.max(
             radius_evidence,  # * node_distance_weights,
             axis=1,
-        )
+        ), match_info
 
     def _get_node_distance_weights(self, distances):
         return (self.max_match_distance - distances) / self.max_match_distance

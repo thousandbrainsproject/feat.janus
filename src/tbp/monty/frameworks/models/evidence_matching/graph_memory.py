@@ -16,6 +16,7 @@ import numpy as np
 
 from tbp.monty.frameworks.models.graph_matching import GraphMemory
 from tbp.monty.frameworks.models.object_model import (
+    DEFAULT_MATCH_EVIDENCE_SMOOTHING,
     GridObjectModel,
     GridTooSmallError,
 )
@@ -66,6 +67,22 @@ class EvidenceGraphMemory(GraphMemory):
         node_directions = all_node_r_features["pose_vectors"]
         num_nodes = len(node_directions)
         return node_directions.reshape((num_nodes, 3, 3))
+
+    def annotate_match_evidence(
+        self, graph_id, input_channel, node_ids, evidence_values
+    ) -> None:
+        """Accumulate match-evidence metadata on a graph's stored model points.
+
+        Args:
+            graph_id: ID of the graph to annotate.
+            input_channel: Identifier of the input channel.
+            node_ids: Indices of the nodes in the graph to annotate.
+            evidence_values: Evidence value each node matched by (one per node
+                id, can be positive or negative).
+        """
+        self.get_graph(graph_id, input_channel).annotate_match_evidence(
+            node_ids, evidence_values
+        )
 
     def get_features_by_name(
         self, graph_id: str, input_channel: str
@@ -129,6 +146,15 @@ class EvidenceGraphMemory(GraphMemory):
                         channel_model._location_grid = (
                             channel_model._location_grid.coalesce()
                         )
+
+                # Models saved before match-evidence annotation was introduced
+                # don't have the metadata store yet.
+                if not hasattr(channel_model, "_match_evidence"):
+                    channel_model._match_evidence = {}
+                if not hasattr(channel_model, "match_evidence_smoothing"):
+                    channel_model.match_evidence_smoothing = (
+                        DEFAULT_MATCH_EVIDENCE_SMOOTHING
+                    )
 
                 logger.info(f"Loaded {model} for {input_channel}")
                 self.models_in_memory[graph_id][input_channel] = channel_model
@@ -220,6 +246,70 @@ class EvidenceGraphMemory(GraphMemory):
             )
         except GridTooSmallError:
             logger.info("Grid too small for given locations. Not updating model.")
+
+    def _split_graph(
+        self,
+        graph_id: str,
+        node_ids_per_channel: dict[str, list[np.ndarray]],
+        new_graph_ids: list[str],
+    ) -> bool:
+        """Split a graph into component graphs built from subsets of its nodes.
+
+        For each channel, a fresh `GridObjectModel` is built per component from
+        the given node subsets. Locations are used as-is (no reference-frame
+        transform), so all components share the source graph's reference frame.
+        The new models start with empty match-evidence metadata since the old
+        annotations were the basis for the split. The source graph is only
+        removed once every channel/component model was built successfully; on
+        `GridTooSmallError` memory is left unchanged.
+
+        Args:
+            graph_id: ID of the graph to split.
+            node_ids_per_channel: Per-channel list of node-id arrays, one array
+                per component (aligned with new_graph_ids).
+            new_graph_ids: IDs to register the component models under.
+
+        Returns:
+            Whether the split succeeded. On failure memory is left unchanged.
+        """
+        logger.info(f"Splitting graph {graph_id} into new graphs {new_graph_ids}.")
+
+        split_models: dict[str, dict[str, GridObjectModel]] = {
+            new_graph_id: {} for new_graph_id in new_graph_ids
+        }
+        for channel, component_node_ids in node_ids_per_channel.items():
+            source_model = self.get_graph(graph_id, channel)
+            locations = np.asarray(source_model.pos)
+            features = self.get_features_by_name(graph_id, channel)
+            for new_graph_id, component_ids in zip(new_graph_ids, component_node_ids):
+                node_ids = np.asarray(component_ids, dtype=int)
+                model = GridObjectModel(
+                    object_id=new_graph_id,
+                    max_nodes=self.max_nodes_per_graph,
+                    max_size=self.max_graph_size,
+                    num_voxels_per_dim=self.num_model_voxels_per_dim,
+                )
+                try:
+                    model.build_model(
+                        locations=locations[node_ids],
+                        features={
+                            name: values[node_ids]
+                            for name, values in features.items()
+                        },
+                    )
+                except GridTooSmallError:
+                    logger.info(
+                        f"Component points for {new_graph_id} ({channel}) do not "
+                        "fit in a grid. Aborting split, memory unchanged."
+                    )
+                    return False
+                split_models[new_graph_id][channel] = model
+
+        for new_graph_id in new_graph_ids:
+            self.models_in_memory[new_graph_id] = split_models[new_graph_id]
+        self.remove_graph_from_memory(graph_id)
+        logger.info(f"Removed graph {graph_id} from memory.")
+        return True
 
     def _merge_graphs(
         self,

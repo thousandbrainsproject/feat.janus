@@ -210,6 +210,25 @@ class EvidenceGraphLM(GraphLM):
             voxel. All locations that fall into the same voxel will be averaged and
             represented as one value. num_model_voxels_per_dim should not be too large
             since the memory requirements grow cubically with this number.
+        split_cluster_separation_threshold: Minimum separation statistic
+            between a fully annotated model's positive-evidence values and its
+            remaining (non-positive) values for the positive values to count
+            as a clear cluster and the model to be split into two component
+            graphs. The statistic is (mean_pos - mean_rest) / std_pos, i.e.
+            how far the positive cluster sits from the rest of the
+            distribution relative to the cluster's own spread. Distributions
+            without a distinct positive cluster measure low (a unimodal
+            Gaussian centered at 0 measures ~2.7, a uniform distribution
+            ~3.5), hence the default of 4.0.
+        split_min_cluster_fraction: Minimum fraction of a fully annotated
+            model's points that each evidence cluster must contain for the
+            model to be split.
+        split_spatial_neighbor_distance: Maximum distance (in meters) to
+            another candidate point of the same split component for a point to
+            be included in the component's new graph. Points without such a
+            neighbor are spatially isolated (they don't belong to a coherent
+            sub-object) and are dropped entirely when the component graphs
+            are built.
         gsg: The goal generator to associate with the LM.
         hypotheses_updater_class: The type of hypotheses updater to associate with the
             LM.
@@ -253,6 +272,9 @@ class EvidenceGraphLM(GraphLM):
         max_nodes_per_graph=2000,
         num_model_voxels_per_dim=50,  # -> voxel size = 6mm3 (0.006)
         use_multithreading=True,
+        split_cluster_separation_threshold=2.0,
+        split_min_cluster_fraction=0.1,
+        split_spatial_neighbor_distance=0.005,
         gsg: EvidenceGoalGenerator | None = None,
         hypotheses_updater_class: type[HypothesesUpdater] = DefaultHypothesesUpdater,
         hypotheses_updater_args: dict | None = None,
@@ -272,6 +294,7 @@ class EvidenceGraphLM(GraphLM):
         if self.gsg:
             self.gsg.parent_lm = self
 
+        print(f"required_symmetry_evidence: {required_symmetry_evidence}")
         # --- Matching Params ---
         self.max_match_distance = max_match_distance
         self.tolerances = tolerances
@@ -289,6 +312,10 @@ class EvidenceGraphLM(GraphLM):
         self.path_similarity_threshold = path_similarity_threshold
         self.pose_similarity_threshold = pose_similarity_threshold
         self.required_symmetry_evidence = required_symmetry_evidence
+        # --- Model Splitting Params ---
+        self.split_cluster_separation_threshold = split_cluster_separation_threshold
+        self.split_min_cluster_fraction = split_min_cluster_fraction
+        self.split_spatial_neighbor_distance = split_spatial_neighbor_distance
         # --- Model Params ---
         self.max_graph_size = max_graph_size
         # --- Debugging Params ---
@@ -329,6 +356,14 @@ class EvidenceGraphLM(GraphLM):
         self.symmetry_evidence = 0
         self._hypotheses = {}
         self._persistent_object_ids: list[str] = []
+        # Persistent hypotheses (and their ids per graph) cached once per matching
+        # step by _update_possible_matches and consumed by
+        # update_terminal_condition and _annotate_matched_nodes.
+        self._persistent_hypotheses: dict[str, Hypotheses] = {}
+        self._persistent_hypothesis_ids: dict[str, npt.NDArray[np.int64]] = {}
+        # Per graph_id info about which model nodes were matched by the tested
+        # hypotheses at the most recent step (popped from updater telemetry).
+        self._latest_match_info: dict[str, dict] = {}
 
         self.hypotheses_updater.reset()  # FIXME: move reset() logic to __init__()
 
@@ -587,6 +622,14 @@ class EvidenceGraphLM(GraphLM):
         max evidence stays >90% stable for required_symmetry_evidence consecutive
         observed steps. Returns {} until then.
 
+        Note:
+            This method mutates state (the possible masks and the symmetry
+            counter) and must only be called once per matching step. It is called
+            from _update_possible_matches; update_terminal_condition consumes the
+            cached result. Alongside the returned hypotheses, the selected
+            hypothesis ids per graph are cached in _persistent_hypothesis_ids
+            (used for model annotation).
+
         Returns:
             The persistent hypotheses per object, or an empty dict if persistence
             has not yet been established.
@@ -597,6 +640,7 @@ class EvidenceGraphLM(GraphLM):
             # forgotten, mirroring the old per-object implementation).
             for hyps in self._hypotheses.values():
                 hyps.possible[:] = False
+            self._persistent_hypothesis_ids = {}
             return {}
 
         current = {
@@ -623,7 +667,9 @@ class EvidenceGraphLM(GraphLM):
                 hyps.possible[selected[graph_id]] = True
 
         if not persistence_detected:
+            self._persistent_hypothesis_ids = {}
             return {}
+        self._persistent_hypothesis_ids = selected
         return {
             graph_id: Hypotheses(
                 evidence=self._hypotheses[graph_id].evidence[ids],
@@ -838,6 +884,19 @@ class EvidenceGraphLM(GraphLM):
             self.possible_matches = self._threshold_possible_matches()
             self.previous_mlh = self.current_mlh
             self.current_mlh = self._calculate_most_likely_hypothesis()
+            # Evaluate the persistence ("high confidence") condition once per
+            # matching step, decoupled from the terminal condition check which
+            # Monty only runs after min steps. update_terminal_condition consumes
+            # this cached result so the symmetry counter is not incremented twice.
+            self._persistent_hypotheses = self.get_persistent_hypotheses()
+            # Once the LM is confident (persistent hypotheses narrowed down to a
+            # single object), annotate the model points near the active
+            # hypotheses with the evidence they matched by.
+            self._annotate_matched_nodes()
+            # If every point of the recognized model is now annotated, check
+            # whether the evidence distribution is bimodal and, if so, split
+            # the model into two component graphs.
+            self._maybe_split_memory()
 
     def _update_evidence(
         self,
@@ -883,6 +942,16 @@ class EvidenceGraphLM(GraphLM):
         )
 
         if hypotheses_update_telemetry is not None:
+            # Extract the match info (which model nodes were matched by the
+            # tested hypotheses) so the large arrays don't end up in the logged
+            # telemetry. Used by _annotate_matched_nodes.
+            match_info = hypotheses_update_telemetry.pop("channel_match_info", None)
+            if match_info:
+                self._latest_match_info[graph_id] = match_info
+            else:
+                # No hypotheses were displaced this step (e.g. initial step), so
+                # any previous match info is stale.
+                self._latest_match_info.pop(graph_id, None)
             self.hypotheses_updater_telemetry[graph_id] = hypotheses_update_telemetry
 
         if hypotheses_update is not None:
@@ -899,6 +968,262 @@ class EvidenceGraphLM(GraphLM):
             assert not np.isnan(np.max(graph_evidence)), "evidence contains NaN."
             logger_msg += f" New max evidence: {np.round(np.max(graph_evidence), 3)}"
         logger.debug(logger_msg)
+
+    def _annotate_matched_nodes(self) -> None:
+        """Annotate model points near the active hypotheses with match evidence.
+
+        Only runs once the LM has reached high confidence, i.e. the persistent
+        hypothesis set (cached by get_persistent_hypotheses this step) has been
+        narrowed down to a single object - either a single hypothesis or a set of
+        symmetric hypotheses. For every model point that was matched against one
+        of these hypotheses this step (a nearest neighbor within
+        max_match_distance of the hypothesis' search location), the evidence it
+        matched by (positive if it matched well, negative if poorly) is folded
+        into an exponential moving average stored in the object model's
+        metadata.
+        """
+        if len(self._persistent_hypothesis_ids) != 1:
+            return
+        graph_id, persistent_ids = next(iter(self._persistent_hypothesis_ids.items()))
+        match_info = self._latest_match_info.get(graph_id)
+        logger.info("Annotating match info!")
+        if not match_info:
+            return
+        for channel, info in match_info.items():
+            # Rows of the tested hypotheses that belong to the persistent set.
+            rows = np.flatnonzero(np.isin(info.tested_hyp_ids, persistent_ids))
+            if rows.size == 0:
+                continue
+            # Only annotate model points within the match radius of a persistent
+            # hypothesis; points further away were not compared against it.
+            in_radius = info.in_radius[rows]
+            node_ids = info.nearest_node_ids[rows][in_radius]
+            evidence_values = info.per_neighbor_evidence[rows][in_radius]
+            if node_ids.size == 0:
+                continue
+            self.graph_memory.annotate_match_evidence(
+                graph_id=graph_id,
+                input_channel=channel,
+                node_ids=node_ids.ravel(),
+                evidence_values=evidence_values.ravel(),
+            )
+            logger.debug(
+                f"Annotated {node_ids.size} matched nodes on {graph_id} "
+                f"({channel}) with match evidence."
+            )
+
+    def _maybe_split_memory(self) -> None:
+        """Split the recognized graph if a positive-evidence cluster stands out.
+
+        Only considered once matching has been narrowed down to a single object
+        ID (a single possible match) and every point of that graph (across all
+        input channels) has been annotated with match evidence. If the points
+        with positive match evidence form a clear cluster in evidence space
+        (see _detect_positive_evidence_cluster), the graph is split into two
+        component graphs: the positive-evidence cluster and all other points.
+        Within each component, points that are spatially isolated (no other
+        component point within split_spatial_neighbor_distance) are dropped
+        entirely. The components share the source graph's reference frame.
+        """
+        possible_matches = self.get_possible_matches()
+        if len(possible_matches) != 1:
+            return
+        graph_id = possible_matches[0]
+
+        evidence_per_channel = {}
+        for channel in self.graph_memory.get_input_channels_in_graph(graph_id):
+            evidence_means, counts = self.graph_memory.get_graph(
+                graph_id, channel
+            ).get_match_evidence()
+            if len(evidence_means) == 0 or np.any(counts == 0):
+                # Not all model points have been annotated yet.
+                logger.info(
+                    f"Not considering a split of {graph_id} ({channel}): "
+                    f"{np.count_nonzero(counts)}/{len(counts)} points "
+                    "annotated."
+                )
+                return
+            evidence_per_channel[channel] = evidence_means
+
+        pooled_evidence = np.concatenate(list(evidence_per_channel.values()))
+        if not self._detect_positive_evidence_cluster(pooled_evidence):
+            logger.info(
+                f"Not considered a split as no positive-evidence cluster found in {graph_id} ({channel})."
+            )
+            return
+
+        # Component 1 is the positive-evidence cluster, component 2 all other
+        # points. Both are filtered for spatial coherence.
+        node_ids_per_channel = {}
+        for channel, evidence_means in evidence_per_channel.items():
+            locations = np.asarray(
+                self.graph_memory.get_locations_in_graph(graph_id, channel)
+            )
+            components = []
+            for candidate_ids in (
+                np.flatnonzero(evidence_means > 0),
+                np.flatnonzero(evidence_means <= 0),
+            ):
+                kept_ids = self._drop_spatially_isolated_points(
+                    candidate_ids, locations
+                )
+                if kept_ids.size < candidate_ids.size:
+                    logger.info(
+                        f"Dropping {candidate_ids.size - kept_ids.size} "
+                        f"spatially isolated candidate points of {graph_id} "
+                        f"({channel}) from the split."
+                    )
+                components.append(kept_ids)
+            if any(component.size == 0 for component in components):
+                logger.info(
+                    f"One of {graph_id}'s split components in channel "
+                    f"{channel} has no spatially coherent points; skipping "
+                    "split."
+                )
+                return
+            node_ids_per_channel[channel] = components
+
+        # Ensure the component ids do not collide with existing graphs so that
+        # registration cannot silently overwrite an existing entry.
+        new_graph_ids = [
+            f"{graph_id}_component_1",
+            f"{graph_id}_component_2",
+        ]
+        existing_ids = set(self.graph_memory.get_memory_ids())
+        while any(new_id in existing_ids for new_id in new_graph_ids):
+            new_graph_ids = [f"{new_id}_split" for new_id in new_graph_ids]
+
+        split = self.graph_memory._split_graph(
+            graph_id=graph_id,
+            node_ids_per_channel=node_ids_per_channel,
+            new_graph_ids=new_graph_ids,
+        )
+        if split:
+            self._cleanup_after_split(graph_id, new_graph_ids)
+            logger.info(
+                f"{self.learning_module_id} split {graph_id} into "
+                f"{new_graph_ids} (positive-evidence cluster vs. rest)."
+            )
+
+    def _detect_positive_evidence_cluster(self, evidence_values) -> bool:
+        """Whether the positive-evidence values form a clear, separate cluster.
+
+        The annotated evidence values of sub-objects do not generally form a
+        bimodal distribution; instead, the points that consistently matched
+        (positive evidence) form a tight cluster while the remaining points
+        are spread out. We therefore partition the values at zero and measure
+        how far the positive cluster sits from the rest of the distribution
+        relative to the cluster's own spread:
+        (mean_pos - mean_rest) / std_pos.
+        A distribution without a distinct positive cluster measures low (a
+        unimodal Gaussian centered at 0 measures ~2.7, a uniform distribution
+        ~3.5); a tight positive cluster that is well separated from the other
+        values measures high. Additionally, each side of the partition must
+        contain at least split_min_cluster_fraction of the values.
+
+        Args:
+            evidence_values: The annotated evidence values of all model points.
+
+        Returns:
+            Whether the positive-evidence values form a clear cluster that
+            warrants splitting the model.
+        """
+        values = np.asarray(evidence_values, dtype=float)
+        if len(values) < 4:
+            return False
+
+        positive = values[values > 0]
+        rest = values[values <= 0]
+        min_cluster_size = self.split_min_cluster_fraction * len(values)
+        if len(positive) < min_cluster_size or len(rest) < min_cluster_size:
+            return False
+
+        cluster_spread = positive.std()
+        separation = positive.mean() - rest.mean()
+        if cluster_spread == 0:
+            # A point mass is infinitely tight relative to its (zero) spread.
+            separation_statistic = np.inf
+        else:
+            separation_statistic = separation / cluster_spread
+        logger.debug(
+            "Positive-evidence cluster check: separation statistic = "
+            f"{np.round(separation_statistic, 3)} "
+            f"(threshold {self.split_cluster_separation_threshold})."
+        )
+        return separation_statistic >= self.split_cluster_separation_threshold
+
+    def _drop_spatially_isolated_points(
+        self,
+        candidate_ids: npt.NDArray[np.int_],
+        locations: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.int_]:
+        """Filter split-candidate points for spatial coherence.
+
+        A point only becomes part of a new component object if it lies within
+        split_spatial_neighbor_distance of at least one other candidate point
+        of the same component. Spatially isolated points (e.g. a single
+        stray positive-evidence point in the middle of the poorly matching
+        region) are dropped entirely when the component graphs are built.
+
+        Args:
+            candidate_ids: Node ids of the component's candidate points.
+            locations: Locations of all nodes in the graph, indexed by node id.
+
+        Returns:
+            The subset of candidate_ids with at least one nearby candidate.
+        """
+        if candidate_ids.size < 2:
+            # A single point has no neighbors, so it is isolated by definition.
+            return candidate_ids[:0]
+        candidate_locations = locations[candidate_ids]
+        candidate_tree = KDTree(candidate_locations)
+        # k=2 returns the nearest candidate other than the point itself.
+        distances, _ = candidate_tree.query(candidate_locations, k=2, p=2, workers=1)
+        has_close_neighbor = distances[:, 1] <= self.split_spatial_neighbor_distance
+        return candidate_ids[has_close_neighbor]
+
+    def _cleanup_after_split(self, old_graph_id: str, new_graph_ids: list[str]) -> None:
+        """Remove all stale references to the split-away graph.
+
+        Since the component graphs share the source graph's reference frame,
+        the source graph's hypotheses (locations and poses) remain valid
+        candidates for both components and are carried over. Evidence for the
+        two components will diverge with subsequent observations.
+
+        Args:
+            old_graph_id: ID of the graph that was split and deleted.
+            new_graph_ids: IDs of the resulting component graphs.
+        """
+        old_hypotheses = self._hypotheses.pop(old_graph_id, Hypotheses.empty())
+        self.hypotheses_updater_telemetry.pop(old_graph_id, None)
+        self._latest_match_info.pop(old_graph_id, None)
+        self.symmetry_evidence = 0
+        self._persistent_object_ids = []
+        self._persistent_hypotheses = {}
+        self._persistent_hypothesis_ids = {}
+
+        self.graph_memory.initialize_feature_arrays()
+
+        # Both components inherit the ground-truth target labels of the source.
+        old_targets = self.graph_id_to_target.pop(old_graph_id, set())
+        for new_graph_id in new_graph_ids:
+            if old_targets:
+                self.graph_id_to_target[new_graph_id] = set(old_targets)
+        for target, graph_ids in self.target_to_graph_id.items():
+            if old_graph_id in graph_ids:
+                remaining_ids = graph_ids.difference({old_graph_id})
+                remaining_ids.update(new_graph_ids)
+                self.target_to_graph_id[target] = remaining_ids
+
+        for new_graph_id in new_graph_ids:
+            self._hypotheses[new_graph_id] = Hypotheses(
+                evidence=old_hypotheses.evidence.copy(),
+                locations=old_hypotheses.locations.copy(),
+                poses=old_hypotheses.poses.copy(),
+                possible=old_hypotheses.possible.copy(),
+            )
+        self.possible_matches = self._threshold_possible_matches()
+        self.current_mlh = self._calculate_most_likely_hypothesis()
 
     def _update_evidence_with_vote(self, votes: list[Message], graph_id):
         """Use incoming votes to update all hypotheses."""
@@ -1154,8 +1479,11 @@ class EvidenceGraphLM(GraphLM):
         for old_id in old_ids:
             self._hypotheses.pop(old_id, None)
             self.hypotheses_updater_telemetry.pop(old_id, None)
+            self._latest_match_info.pop(old_id, None)
         self.symmetry_evidence = 0
         self._persistent_object_ids = []
+        self._persistent_hypotheses = {}
+        self._persistent_hypothesis_ids = {}
 
         self.graph_memory.initialize_feature_arrays()
 
@@ -1231,7 +1559,10 @@ class EvidenceGraphLM(GraphLM):
                     self.buffer.get_current_location(input_channel="first")
                 )
         elif self.buffer.get_num_observations_on_object() > 0:
-            persistent = self.get_persistent_hypotheses()
+            # Consume the persistence result cached by _update_possible_matches
+            # this step. Calling get_persistent_hypotheses here again would
+            # increment the symmetry counter twice per step.
+            persistent = self._persistent_hypotheses
             self._persistent_object_ids = list(persistent.keys())
             if not persistent:
                 if self.terminal_state == "match":
@@ -1445,7 +1776,11 @@ class EvidenceGraphLM(GraphLM):
             # don't try to log prediction errors if there were no observations or LM
             # detected no match.
             return
-        graph_telemetry = self.hypotheses_updater_telemetry[graph_id]
+        # The graph may have been split or merged away this step, in which case
+        # its telemetry was removed and there is no prediction error to log.
+        graph_telemetry = self.hypotheses_updater_telemetry.get(graph_id)
+        if graph_telemetry is None:
+            return
         mlh_prediction_error = graph_telemetry.get("mlh_prediction_error")
 
         if mlh_prediction_error is not None:

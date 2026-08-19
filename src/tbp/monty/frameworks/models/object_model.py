@@ -40,6 +40,12 @@ from tbp.monty.frameworks.utils.spatial_arithmetics import apply_rf_transform_to
 
 logger = logging.getLogger(__name__)
 
+# Default smoothing factor for the exponential moving average of match evidence
+# annotations. Each new evidence value contributes this fraction to the stored
+# mean (mean += smoothing * (evidence - mean)), so higher values weight recent
+# matches more strongly while older annotations decay.
+DEFAULT_MATCH_EVIDENCE_SMOOTHING = 0.1
+
 
 class GraphObjectModel(ObjectModel):
     """Object model class that represents object as graphs."""
@@ -402,6 +408,19 @@ class GridObjectModel(GraphObjectModel):
         # filled or used to constrain nodes in graph.
         self.use_original_graph = False
         self._location_tree = None
+        # Match-evidence metadata accumulated during inference. Maps a voxel index
+        # (i, j, k) to [mean_evidence, count], where mean_evidence is an
+        # exponential moving average of the evidence values the voxel matched by
+        # (bounded by the range of per-step evidence values and weighted towards
+        # recent matches). Voxels without an entry are unannotated (None
+        # semantics). Stored at the voxel level (rather than per graph node) so
+        # annotations survive graph rebuilds in update_model, and as a plain dict
+        # so it serializes cleanly with torch.save.
+        self._match_evidence: dict[tuple[int, int, int], list] = {}
+        # Smoothing factor of the exponential moving average. Each new evidence
+        # value contributes this fraction to the stored mean, so higher values
+        # weight recent matches more strongly.
+        self.match_evidence_smoothing = DEFAULT_MATCH_EVIDENCE_SMOOTHING
 
     # =============== Public Interface Functions ===============
     # ------------------- Main Algorithm -----------------------
@@ -502,6 +521,81 @@ class GridObjectModel(GraphObjectModel):
             return distances
 
         return nearest_node_ids
+
+    def annotate_match_evidence(self, node_ids, evidence_values) -> None:
+        """Accumulate match-evidence metadata for the given graph nodes.
+
+        The nodes' locations are mapped to voxel indices and each evidence value
+        is folded into an exponential moving average stored for that voxel
+        (mean += match_evidence_smoothing * (evidence - mean), seeded with the
+        first observed value). This keeps the stored value bounded by the range
+        of the per-step evidence values and weights recent matches more
+        strongly, letting old annotations decay. Storing the metadata at the
+        voxel level means it survives graph rebuilds in update_model and
+        persists across episodes as part of the model.
+
+        Args:
+            node_ids: Indices of nodes in the graph to annotate.
+            evidence_values: Evidence value each node matched by (one per node
+                id, can be positive or negative).
+        """
+        if self._graph is None:
+            return
+        if getattr(self, "_location_scale_factor", None) is None:
+            # Pretrained models loaded with use_original_graph=True never built
+            # grids. Only the location->voxel mapping is needed for annotation,
+            # so initialize it lazily from the first graph node.
+            self._initialize_location_mapping(np.asarray(self.pos[0]))
+        node_ids = np.asarray(node_ids, dtype=int)
+        evidence_values = np.asarray(evidence_values, dtype=float)
+        voxel_ids = self._locations_to_grid_ids(np.asarray(self.pos)[node_ids])
+        for voxel, evidence in zip(voxel_ids, evidence_values):
+            key = (int(voxel[0]), int(voxel[1]), int(voxel[2]))
+            entry = self._match_evidence.get(key)
+            if entry is None:
+                # Seed the average with the first value instead of biasing it
+                # towards 0.
+                self._match_evidence[key] = [float(evidence), 1]
+            else:
+                entry[1] += 1
+                entry[0] += self.match_evidence_smoothing * (
+                    float(evidence) - entry[0]
+                )
+
+    def get_match_evidence(self, node_ids=None):
+        """Return the average match evidence for graph nodes.
+
+        Args:
+            node_ids: Indices of nodes to look up. If None, all nodes in the
+                graph are looked up.
+
+        Returns:
+            Tuple of (evidence_means, counts) arrays, one entry per requested
+            node. evidence_means holds the exponential moving average of the
+            evidence values the node's voxel matched by. Nodes whose voxel was
+            never annotated get np.nan / 0.
+        """
+        if self._graph is None:
+            return np.array([]), np.array([], dtype=int)
+        positions = np.asarray(self.pos)
+        if node_ids is not None:
+            positions = positions[np.asarray(node_ids, dtype=int)]
+        evidence_means = np.full(len(positions), np.nan)
+        counts = np.zeros(len(positions), dtype=int)
+        if (
+            not self._match_evidence
+            or getattr(self, "_location_scale_factor", None) is None
+        ):
+            return evidence_means, counts
+        voxel_ids = self._locations_to_grid_ids(positions)
+        for i, voxel in enumerate(voxel_ids):
+            entry = self._match_evidence.get(
+                (int(voxel[0]), int(voxel[1]), int(voxel[2]))
+            )
+            if entry is not None:
+                evidence_means[i] = entry[0]
+                counts[i] = entry[1]
+        return evidence_means, counts
 
     # ------------------ Getters & Setters ---------------------
     def set_graph(self, graph):
